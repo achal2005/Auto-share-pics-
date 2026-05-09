@@ -3,15 +3,18 @@
   "version": "1.0.0",
   "description": "AutoSharePics helper scripts",
   "scripts": {
+    "validate-env": "node validate-env.js --env=../.env",
     "compreface:list": "node setup-compreface.js --action=list",
     "compreface:bulk": "node setup-compreface.js --action=bulk --dir=../reference_photos",
-    "compreface:test": "node setup-compreface.js --action=test"
+    "compreface:test": "node setup-compreface.js --action=test",
+    "evolution:pair": "node pair-whatsapp.js"
   },
   "dependencies": {
     "axios": "^1.7.0",
     "form-data": "^4.0.0",
     "fs-extra": "^11.2.0",
     "glob": "^10.3.0",
+    "heic-convert": "^2.1.0",
     "yargs": "^17.7.0"
   }
 }
