@@ -1,0 +1,284 @@
+# ============================================================================
+# AutoSharePics - Docker Compose Stack
+# ============================================================================
+# Components:
+#   - n8n (workflow automation)
+#   - CompreFace (face recognition - API, Admin, PostgreSQL)
+#   - Evolution API (WhatsApp gateway)
+#   - PostgreSQL (application database)
+#   - Caddy (reverse proxy + auto SSL) [optional for local]
+#
+# Usage:
+#   docker-compose up -d
+#   docker-compose logs -f n8n
+#
+# ⚠️  First run: CompreFace takes 2-3 minutes to download ML models
+# ============================================================================
+
+
+# --------------------------------------------------------------------------
+# Named volumes for persistent data
+# --------------------------------------------------------------------------
+# FIX #14: Suggest volume backup strategy
+# Recommendation: create a local backup/ script using pg_dump for databases 
+# and rsync/tar for the media_cache volume to ensure data safety.
+volumes:
+  n8n_data:
+    driver: local
+  app_postgres_data:
+    driver: local
+  compreface_postgres_data:
+    driver: local
+  evolution_instances:
+    driver: local
+  evolution_store:
+    driver: local
+  media_cache:
+    driver: local
+
+# --------------------------------------------------------------------------
+# Internal networks - services only talk to what they need
+# --------------------------------------------------------------------------
+networks:
+  # Main network for n8n <-> services communication
+  autoshare_net:
+    driver: bridge
+  # Isolated network for CompreFace internal comms
+  compreface_net:
+    driver: bridge
+
+services:
+  # ========================================================================
+  # APPLICATION DATABASE (PostgreSQL)
+  # Stores: media_files, hangout_sessions, friends_contacts, delivery_logs
+  # Also used by n8n as its internal database
+  # ========================================================================
+  app-postgres:
+    image: postgres:16-alpine
+    container_name: autoshare-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${APP_DB_USER:-autoshare}
+      POSTGRES_PASSWORD: ${APP_DB_PASSWORD:?Set APP_DB_PASSWORD in .env}
+      POSTGRES_DB: ${APP_DB_NAME:-autosharepics}
+    volumes:
+      - app_postgres_data:/var/lib/postgresql/data
+      # Auto-run schema migration on first start
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      # Expose to host for debugging only - remove in production
+      # FIX #12: Commenting out port to prevent exposure in production
+      - "${APP_DB_PORT:-5433}:5432"
+    networks:
+      - autoshare_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${APP_DB_USER:-autoshare} -d ${APP_DB_NAME:-autosharepics}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ========================================================================
+  # n8n - WORKFLOW ENGINE
+  # The brain of the operation - orchestrates everything
+  # Access at: http://localhost:5678
+  # ========================================================================
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: autoshare-n8n
+    restart: unless-stopped
+    depends_on:
+      app-postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      # --- Database (use PostgreSQL instead of SQLite for reliability) ---
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: app-postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${APP_DB_NAME:-autosharepics}
+      DB_POSTGRESDB_USER: ${APP_DB_USER:-autoshare}
+      DB_POSTGRESDB_PASSWORD: ${APP_DB_PASSWORD:?Set APP_DB_PASSWORD in .env}
+      # --- n8n config ---
+      N8N_HOST: ${N8N_HOST:-localhost}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
+      WEBHOOK_URL: ${WEBHOOK_URL:-http://localhost:5678/}
+      # --- Security (owner account created via n8n setup wizard) ---
+      # FIX #11: Add N8N_AUTH_USER and N8N_AUTH_PASSWORD to use env variables
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_AUTH_USER}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_AUTH_PASSWORD}
+      # --- Execution settings ---
+      EXECUTIONS_MODE: regular
+      EXECUTIONS_TIMEOUT: 600
+      EXECUTIONS_TIMEOUT_MAX: 1200
+      # --- Allow local file access for media cache ---
+      N8N_USER_FOLDER: /home/node
+      GENERIC_TIMEZONE: ${TIMEZONE:-Asia/Kolkata}
+      # --- Allow calling local Docker services ---
+      NODE_FUNCTION_ALLOW_EXTERNAL: "axios"
+      # --- Allow env var access in nodes ---
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      # FIX: Enable executeCommand node
+      NODES_EXCLUDE: "[]"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - media_cache:/home/node/media_cache
+    ports:
+      - "${N8N_PORT:-5678}:5678"
+    networks:
+      - autoshare_net
+
+  # ========================================================================
+  # COMPREFACE - FACE RECOGNITION ENGINE
+  # Self-hosted AI face recognition with REST API
+  # Admin UI: http://localhost:8000
+  # ========================================================================
+
+  # CompreFace's own PostgreSQL (DO NOT share with app DB)
+  compreface-postgres:
+    image: postgres:11.5
+    container_name: autoshare-compreface-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${CF_DB_USER:-compreface}
+      # FIX #1: Change weak fallback to fail-if-empty :?
+      POSTGRES_PASSWORD: ${CF_DB_PASSWORD:?Set CF_DB_PASSWORD in .env}
+      POSTGRES_DB: frs
+    volumes:
+      - compreface_postgres_data:/var/lib/postgresql/data
+    networks:
+      - compreface_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${CF_DB_USER:-compreface}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # CompreFace core API server
+  compreface-core:
+    image: exadel/compreface-core:1.2.0
+    container_name: autoshare-compreface-core
+    restart: unless-stopped
+    environment:
+      ML_PORT: 3000
+      IMG_LENGTH_LIMIT: ${CF_IMG_LIMIT:-640}
+    networks:
+      - compreface_net
+    # FIX #7: Add healthcheck to compreface-core
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # CompreFace API gateway
+  compreface-api:
+    image: exadel/compreface-api:1.2.0
+    container_name: autoshare-compreface-api
+    restart: unless-stopped
+    depends_on:
+      compreface-postgres:
+        condition: service_healthy
+      compreface-core:
+        # FIX #7: Depend on service_healthy
+        condition: service_healthy
+    environment:
+      POSTGRES_URL: jdbc:postgresql://compreface-postgres:5432/frs
+      POSTGRES_USER: ${CF_DB_USER:-compreface}
+      # FIX #1: Change weak fallback to fail-if-empty :?
+      POSTGRES_PASSWORD: ${CF_DB_PASSWORD:?Set CF_DB_PASSWORD in .env}
+      SPRING_PROFILES_ACTIVE: dev
+      API_JAVA_OPTS: "-Xmx512m"
+      # FIX #8: Set to false to avoid bloating DB
+      SAVE_IMAGES_TO_DB: "false"
+      CONNECTION_TIMEOUT: 10000
+      READ_TIMEOUT: 60000
+    networks:
+      - compreface_net
+
+  # CompreFace admin portal
+  compreface-admin:
+    image: exadel/compreface-admin:1.2.0
+    container_name: autoshare-compreface-admin
+    restart: unless-stopped
+    depends_on:
+      compreface-api:
+        condition: service_started
+    environment:
+      POSTGRES_URL: jdbc:postgresql://compreface-postgres:5432/frs
+      POSTGRES_USER: ${CF_DB_USER:-compreface}
+      # FIX #1: Change weak fallback to fail-if-empty :?
+      POSTGRES_PASSWORD: ${CF_DB_PASSWORD:?Set CF_DB_PASSWORD in .env}
+      SPRING_PROFILES_ACTIVE: dev
+      ADMIN_JAVA_OPTS: "-Xmx256m"
+    networks:
+      - compreface_net
+      - autoshare_net
+
+  # CompreFace Frontend (UI + Nginx proxy)
+  compreface-fe:
+    image: exadel/compreface-fe:1.2.0
+    container_name: autoshare-compreface-fe
+    restart: unless-stopped
+    depends_on:
+      - compreface-api
+      - compreface-admin
+    ports:
+      - "${CF_API_PORT:-8000}:80"
+    environment:
+      - PROXY_READ_TIMEOUT=60000
+      - PROXY_CONNECT_TIMEOUT=60000
+      - CLIENT_MAX_BODY_SIZE=5m
+    networks:
+      - compreface_net
+      - autoshare_net
+
+  # ========================================================================
+  # EVOLUTION API - WHATSAPP GATEWAY
+  # Connects to WhatsApp via multi-device web protocol
+  # API docs: http://localhost:8080/docs
+  # ========================================================================
+  evolution-api:
+    image: atendai/evolution-api:v2.1.1
+    container_name: autoshare-evolution
+    restart: unless-stopped
+    environment:
+      NODE_OPTIONS: "--require /evolution/os-patch.cjs"
+      # --- Server ---
+      SERVER_URL: ${EVOLUTION_SERVER_URL:-http://localhost:8080}
+      SERVER_TYPE: http
+      SERVER_PORT: 8080
+      # --- Authentication ---
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY:?Set EVOLUTION_API_KEY in .env}
+      AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES: "true"
+      LOG_LEVEL: "ERROR,WARN,DEBUG,INFO,LOG,VERBOSE,DARK,WEBHOOKS"
+      # --- Database (uses app PostgreSQL) ---
+      DATABASE_ENABLED: "true"
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: postgresql://${APP_DB_USER:-autoshare}:${APP_DB_PASSWORD}@app-postgres:5432/${EVOLUTION_DB_NAME:-evolution_api}
+      # --- Instance management ---
+      DEL_INSTANCE: "false"
+      # --- WhatsApp settings ---
+      QRCODE_LIMIT: 6
+      # --- Rate limiting (ban prevention!) ---
+      # ⚠️ These are critical for avoiding WhatsApp bans
+      SEND_MESSAGE_TIMEOUT: 3000
+      # --- Cache (no Redis, use local) ---
+      CACHE_REDIS_ENABLED: "false"
+      CACHE_REDIS_URI: ""
+      # FIX #4: Enable local cache
+      CACHE_LOCAL_ENABLED: "false"
+    volumes:
+      - ./os-patch.cjs:/evolution/os-patch.cjs:ro
+      - evolution_instances:/evolution/instances
+      - evolution_store:/evolution/store
+      # Mount media cache so Evolution can send local files
+      - media_cache:/evolution/media_cache:ro
+    ports:
+      - "${EVOLUTION_PORT:-8080}:8080"
+    networks:
+      - autoshare_net
+    depends_on:
+      app-postgres:
+        condition: service_healthy

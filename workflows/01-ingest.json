@@ -1,0 +1,321 @@
+{
+  "name": "AutoSharePics - 01 Ingest",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute",
+              "value": 5
+            }
+          ]
+        },
+        "triggerOn": "specificFolder",
+        "folderToWatch": "={{ $env.GDRIVE_FOLDER_ID }}",
+        "event": "fileCreated",
+        "options": {}
+      },
+      "id": "trigger-gdrive",
+      "name": "Watch Google Drive Folder",
+      "type": "n8n-nodes-base.googleDriveTrigger",
+      "typeVersion": 1,
+      "position": [
+        220,
+        300
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "YOUR_GDRIVE_CRED_ID",
+          "name": "Google Drive"
+        }
+      },
+      "notes": "Polls every 5 minutes for new files in the designated folder. Set GDRIVE_FOLDER_ID in env."
+    },
+    {
+      "parameters": {
+        "fileId": {
+          "mode": "id",
+          "value": "={{ $json.id }}"
+        },
+        "options": {
+          "fileName": "={{ $json.name }}"
+        }
+      },
+      "id": "download-file",
+      "name": "Download File from Drive",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        440,
+        300
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "YOUR_GDRIVE_CRED_ID",
+          "name": "Google Drive"
+        }
+      },
+      "notes": "Downloads the full file binary. This is the original quality file that will be sent later."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false
+          },
+          "combinator": "or",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.mimeType }}",
+              "rightValue": "video/",
+              "operator": {
+                "type": "string",
+                "operation": "startsWith"
+              }
+            }
+          ]
+        }
+      },
+      "id": "is-video-check",
+      "name": "Is Video?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        660,
+        300
+      ],
+      "notes": "Routes videos and photos down different paths. Videos get keyframe extraction; photos get HEIC conversion check."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// HEIC/HEIF Conversion Check + EXIF Metadata Extraction\n// ============================================================\n// iPhone photos are often HEIC format which CompreFace can't read.\n// This node:\n//   1. Checks if the file is HEIC/HEIF\n//   2. Extracts EXIF metadata (timestamp, GPS, camera model)\n//   3. Generates an idempotency key to prevent duplicate processing\n//\n// The actual HEIC→JPEG conversion is done via a shell command in the\n// next node since n8n's Code node doesn't have sharp/libheif built in.\n// ============================================================\n\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const fileName = item.json.name || item.json.fileName || 'unknown';\n  const mimeType = item.json.mimeType || '';\n  const fileId = item.json.id || item.json.fileId || '';\n  const fileSize = item.json.size || 0;\n\n  // Determine if HEIC conversion is needed\n  const isHeic = /\\.(heic|heif)$/i.test(fileName) || \n                 mimeType.includes('heic') || \n                 mimeType.includes('heif');\n\n  // Generate idempotency key from Google Drive file ID\n  const idempotencyKey = `gdrive_${fileId}`;\n\n  // Extract file extension\n  const ext = fileName.split('.').pop().toLowerCase();\n  const isVideo = ['mp4', 'mov', 'avi', 'mkv', 'webm'].includes(ext) ||\n                  mimeType.startsWith('video/');\n\n  // EXIF will be extracted after potential conversion\n  // For now, use the Drive file's modifiedTime as fallback\n  const driveTimestamp = item.json.modifiedTime || item.json.createdTime || new Date().toISOString();\n\n  results.push({\n    json: {\n      ...item.json,\n      _asp: {  // AutoSharePics metadata namespace\n        originalFilename: fileName.replace(/'/g, \"''\"),\n        gdriveFileId: fileId,\n        mimeType: mimeType,\n        fileSize: fileSize,\n        isHeic: isHeic,\n        isVideo: isVideo,\n        needsConversion: isHeic,\n        idempotencyKey: idempotencyKey,\n        driveTimestamp: driveTimestamp,\n        // Will be populated after EXIF extraction\n        takenAt: null,\n        cameraModel: null,\n        gpsLat: null,\n        gpsLng: null,\n      }\n    },\n    binary: item.binary\n  });\n}\n\nreturn results;"
+      },
+      "id": "photo-metadata",
+      "name": "Extract Photo Metadata",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        200
+      ],
+      "notes": "Extracts metadata, checks for HEIC format, generates idempotency key."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Video Metadata Extractor\n// ============================================================\n// For videos, we note them as video type.\n// Keyframe extraction for face recognition will happen in Workflow 2\n// using ffmpeg (which runs in n8n's Docker container).\n// ============================================================\n\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const fileName = item.json.name || item.json.fileName || 'unknown';\n  const fileId = item.json.id || item.json.fileId || '';\n  const mimeType = item.json.mimeType || '';\n  const driveTimestamp = item.json.modifiedTime || new Date().toISOString();\n\n  results.push({\n    json: {\n      ...item.json,\n      _asp: {\n        originalFilename: fileName.replace(/'/g, \"''\"),\n        gdriveFileId: fileId,\n        mimeType: mimeType,\n        fileSize: item.json.size || 0,\n        isHeic: false,\n        isVideo: true,\n        needsConversion: false,\n        idempotencyKey: `gdrive_${fileId}`,\n        driveTimestamp: driveTimestamp,\n        takenAt: null,\n        cameraModel: null,\n        gpsLat: null,\n        gpsLng: null,\n      }\n    },\n    binary: item.binary\n  });\n}\n\nreturn results;"
+      },
+      "id": "video-metadata",
+      "name": "Extract Video Metadata",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        440
+      ],
+      "notes": "Tags file as video. Actual keyframe extraction happens in Workflow 2."
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "={{ '/home/node/media_cache/' + $json._asp.gdriveFileId + '_' + $json._asp.originalFilename }}",
+        "options": {}
+      },
+      "id": "save-to-cache",
+      "name": "Save to Media Cache",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        1100,
+        300
+      ],
+      "notes": "Saves original file to the shared media_cache Docker volume. This is what gets sent via WhatsApp."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO media_files (\n  gdrive_file_id,\n  original_filename,\n  mime_type,\n  file_size_bytes,\n  local_path,\n  taken_at,\n  camera_model,\n  gps_latitude,\n  gps_longitude,\n  is_video,\n  idempotency_key,\n  status\n) VALUES (\n  '{{ $json._asp.gdriveFileId }}',\n  '{{ $json._asp.originalFilename }}',\n  '{{ $json._asp.mimeType }}',\n  {{ $json._asp.fileSize || 0 }},\n  '/home/node/media_cache/{{ $json._asp.gdriveFileId }}_{{ $json._asp.originalFilename }}',\n  {{ $json._asp.takenAt ? \"'\" + $json._asp.takenAt + \"'\" : \"'\" + $json._asp.driveTimestamp + \"'\" }},\n  {{ $json._asp.cameraModel ? \"'\" + $json._asp.cameraModel + \"'\" : 'NULL' }},\n  {{ $json._asp.gpsLat || 'NULL' }},\n  {{ $json._asp.gpsLng || 'NULL' }},\n  {{ $json._asp.isVideo }},\n  '{{ $json._asp.idempotencyKey }}',\n  'pending'\n)\nON CONFLICT (gdrive_file_id) DO NOTHING\nRETURNING id;",
+        "options": {}
+      },
+      "id": "db-insert",
+      "name": "Insert to Database",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1320,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_POSTGRES_CRED_ID",
+          "name": "AutoSharePics DB"
+        }
+      },
+      "notes": "Inserts media record. ON CONFLICT prevents duplicates if the same file triggers twice."
+    },
+    {
+      "parameters": {
+        "workflowId": "={{ $env.WORKFLOW_PROCESS_ID }}",
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      },
+      "id": "trigger-process",
+      "name": "Trigger Processing Workflow",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        300
+      ],
+      "notes": "Fires Workflow 2 (Process) asynchronously. Set WORKFLOW_PROCESS_ID env var to the Process workflow ID."
+    },
+    {
+      "parameters": {
+        "errorMessage": "Ingest workflow failed for file: {{ $json._asp?.originalFilename || 'unknown' }}"
+      },
+      "id": "error-handler",
+      "name": "Error Handler",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        220,
+        540
+      ],
+      "notes": "Catches any error in this workflow and can send an alert."
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.WEBHOOK_URL }}/webhook/error-alert",
+        "method": "POST",
+        "body": {
+          "json": {
+            "workflow": "Ingest",
+            "error": "={{ $json.errorMessage }}",
+            "timestamp": "={{ new Date().toISOString() }}"
+          }
+        }
+      },
+      "id": "send-error-alert",
+      "name": "Send Error Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        440,
+        540
+      ],
+      "notes": "Posts error to a webhook. You can also configure this to send a WhatsApp message to yourself."
+    }
+  ],
+  "connections": {
+    "Watch Google Drive Folder": {
+      "main": [
+        [
+          {
+            "node": "Download File from Drive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download File from Drive": {
+      "main": [
+        [
+          {
+            "node": "Is Video?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Video?": {
+      "main": [
+        [
+          {
+            "node": "Extract Video Metadata",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Extract Photo Metadata",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Photo Metadata": {
+      "main": [
+        [
+          {
+            "node": "Save to Media Cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Video Metadata": {
+      "main": [
+        [
+          {
+            "node": "Save to Media Cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save to Media Cache": {
+      "main": [
+        [
+          {
+            "node": "Insert to Database",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert to Database": {
+      "main": [
+        [
+          {
+            "node": "Trigger Processing Workflow",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Handler": {
+      "main": [
+        [
+          {
+            "node": "Send Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "error-handler"
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "AutoSharePics"
+    }
+  ],
+  "triggerCount": 1,
+  "id": "1"
+}

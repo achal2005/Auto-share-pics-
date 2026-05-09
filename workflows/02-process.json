@@ -1,0 +1,435 @@
+{
+  "name": "AutoSharePics - 02 Process",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "trigger-from-ingest",
+      "name": "Called by Ingest Workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        220,
+        300
+      ],
+      "notes": "Triggered by Workflow 1 after a new file is ingested. Also runs on schedule as a catch-all."
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "schedule-catchall",
+      "name": "Catch-All Schedule (30 min)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        220,
+        500
+      ],
+      "notes": "Safety net: processes any files stuck in 'pending' status every 30 minutes."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, gdrive_file_id, original_filename, mime_type, local_path, is_video, taken_at, process_attempts\nFROM media_files\nWHERE status = 'pending'\n  AND process_attempts < 3\nORDER BY ingested_at ASC\nLIMIT 20;",
+        "options": {}
+      },
+      "id": "load-pending",
+      "name": "Load Pending Media",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        480,
+        380
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_POSTGRES_CRED_ID",
+          "name": "AutoSharePics DB"
+        }
+      },
+      "notes": "Fetches up to 20 unprocessed files. Skips files that have failed 3+ times."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.is_video }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      },
+      "id": "is-video-branch",
+      "name": "Is Video?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        700,
+        380
+      ],
+      "notes": "Videos need keyframe extraction before face recognition."
+    },
+    {
+      "parameters": {
+        "command": "=mkdir -p /home/node/media_cache/keyframes && ffmpeg -i \"{{ $json.local_path }}\" -vf \"select=eq(pict_type\\,I)\" -vsync vfr -frames:v 5 \"/home/node/media_cache/keyframes/{{ $json.id }}_%03d.jpg\" 2>&1 && ls -la /home/node/media_cache/keyframes/{{ $json.id }}_*.jpg | wc -l"
+      },
+      "id": "extract-keyframes",
+      "name": "Extract Video Keyframes",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        920,
+        240
+      ],
+      "notes": "Extracts up to 5 I-frames (keyframes) from the video using ffmpeg. These are used for face recognition only — the original video is what gets sent to friends."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Prepare Keyframes for Face Recognition\n// ============================================================\n// After ffmpeg extracts keyframes, this node creates an array\n// of items — one per keyframe — so each can be sent to CompreFace.\n// ============================================================\n\nconst item = $input.first();\nconst mediaId = item.json.id;\nconst stdout = item.json.stdout || '0';\nconst keyframeCount = parseInt(stdout.trim()) || 0;\n\nif (keyframeCount === 0) {\n  // No keyframes extracted — might be a very short video\n  // Send original file to face recognition anyway\n  return [{\n    json: {\n      ...item.json,\n      _keyframePath: item.json.local_path,\n      _keyframeIndex: 0,\n      _totalKeyframes: 1,\n      _isKeyframe: false\n    }\n  }];\n}\n\n// Create one item per keyframe\nconst results = [];\nfor (let i = 1; i <= Math.min(keyframeCount, 5); i++) {\n  const kfPath = `/home/node/media_cache/keyframes/${mediaId}_${String(i).padStart(3, '0')}.jpg`;\n  results.push({\n    json: {\n      ...item.json,\n      _keyframePath: kfPath,\n      _keyframeIndex: i,\n      _totalKeyframes: keyframeCount,\n      _isKeyframe: true\n    }\n  });\n}\n\nreturn results;"
+      },
+      "id": "prepare-keyframes",
+      "name": "Prepare Keyframe Items",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        240
+      ],
+      "notes": "Splits keyframes into individual items for batch face recognition."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://autoshare-compreface-fe:80/api/v1/recognition/recognize",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "={{ $env.CF_RECOGNITION_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "file",
+              "parameterType": "formBinaryData",
+              "inputDataFieldName": "={{ $json._keyframePath || $json.local_path }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "fullResponse": false
+        }
+      },
+      "id": "compreface-recognize-video",
+      "name": "CompreFace: Recognize (Video Frames)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1360,
+        240
+      ],
+      "notes": "Sends each keyframe to CompreFace for face recognition."
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "fileName": "={{ $json.local_path }}",
+        "options": {}
+      },
+      "id": "read-photo-file",
+      "name": "Read Photo from Disk",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        920,
+        480
+      ],
+      "notes": "Reads the photo file from media_cache into binary so CompreFace can process it."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://autoshare-compreface-fe:80/api/v1/recognition/recognize",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "={{ $env.CF_RECOGNITION_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "file",
+              "parameterType": "formBinaryData",
+              "inputDataFieldName": "data"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "compreface-recognize-photo",
+      "name": "CompreFace: Recognize (Photo)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1140,
+        480
+      ],
+      "notes": "Sends the photo binary to CompreFace for face recognition."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Parse Face Recognition Results\n// ============================================================\n// CompreFace returns an array of detected faces, each with:\n//   - box: {x_min, y_min, x_max, y_max, probability}\n//   - subjects: [{subject, similarity}]\n//\n// This node:\n//   1. Filters matches above the confidence threshold\n//   2. Deduplicates friend names (same person in multiple keyframes)\n//   3. Prepares data for database update\n// ============================================================\n\nconst THRESHOLD = parseFloat($env.FACE_CONFIDENCE_THRESHOLD) || 0.85;\n\n// Collect all results (may be from multiple keyframes for videos)\nconst items = $input.all();\nconst allFaces = [];\nconst friendsSet = new Set();\n\nfor (const item of items) {\n  const result = item.json.result || item.json.body?.result || [];\n  \n  for (const face of result) {\n    const subjects = face.subjects || [];\n    const bestMatch = subjects.length > 0 ? subjects[0] : null;\n    \n    if (bestMatch && bestMatch.similarity >= THRESHOLD) {\n      friendsSet.add(bestMatch.subject);\n      allFaces.push({\n        subject: bestMatch.subject,\n        similarity: Math.round(bestMatch.similarity * 1000) / 1000,\n        box: face.box,\n        keyframeIndex: item.json._keyframeIndex || 0\n      });\n    } else if (face.box && face.box.probability > 0.8) {\n      // Face detected but not recognized — log it anyway\n      allFaces.push({\n        subject: '_unknown',\n        similarity: bestMatch ? bestMatch.similarity : 0,\n        box: face.box,\n        keyframeIndex: item.json._keyframeIndex || 0\n      });\n    }\n  }\n}\n\n// Get the original media file info from the first item\nconst firstItem = items[0].json;\nconst mediaId = firstItem.id;\nconst friendsList = Array.from(friendsSet).sort().map(f => f.replace(/'/g, \"''\"));\n\nreturn [{\n  json: {\n    mediaId: mediaId,\n    gdriveFileId: firstItem.gdrive_file_id || firstItem.gdriveFileId,\n    originalFilename: firstItem.original_filename || firstItem.originalFilename,\n    isVideo: firstItem.is_video || firstItem.isVideo || false,\n    takenAt: firstItem.taken_at || firstItem.takenAt,\n    localPath: firstItem.local_path || firstItem.localPath,\n    facesDetected: allFaces.length,\n    facesRecognized: JSON.stringify(allFaces).replace(/'/g, \"''\"),\n    friendsIdentified: friendsList,\n    friendCount: friendsList.length,\n    // For display\n    friendNames: friendsList.join(', ') || 'No friends recognized',\n  }\n}];"
+      },
+      "id": "parse-faces",
+      "name": "Parse Recognition Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        480
+      ],
+      "notes": "Filters faces above confidence threshold, deduplicates across keyframes, extracts friend names."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Session Clustering\n// ============================================================\n// Groups photos into \"hangout sessions\" using a 6-hour time window.\n// Logic:\n//   1. Look at the photo's taken_at timestamp\n//   2. Find the most recent session that ended within 6 hours\n//   3. If found → add to that session\n//   4. If not → create a new session\n//\n// The session_id is a deterministic hash based on the 6-hour window,\n// so the same photo always maps to the same session regardless of\n// processing order.\n// ============================================================\n\nconst SESSION_WINDOW_HOURS = 6;\nconst item = $input.first();\nconst takenAt = new Date(item.json.takenAt || new Date());\n\n// Calculate session window start\n// Round down to nearest 6-hour block\nconst msPerWindow = SESSION_WINDOW_HOURS * 60 * 60 * 1000;\nconst windowStart = new Date(Math.floor(takenAt.getTime() / msPerWindow) * msPerWindow);\nconst windowEnd = new Date(windowStart.getTime() + msPerWindow);\n\n// Create a deterministic session key from the window\nconst sessionKey = `session_${windowStart.toISOString().split('T')[0]}_${windowStart.getHours().toString().padStart(2, '0')}`;\n\n// Generate a readable session name\nconst dateStr = windowStart.toLocaleDateString('en-IN', { weekday: 'short', month: 'short', day: 'numeric' });\nconst timeStr = windowStart.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });\nconst sessionName = `Hangout ${dateStr} ${timeStr}`;\n\nreturn [{\n  json: {\n    ...item.json,\n    sessionKey: sessionKey,\n    sessionName: sessionName,\n    windowStart: windowStart.toISOString(),\n    windowEnd: windowEnd.toISOString(),\n  }\n}];"
+      },
+      "id": "session-cluster",
+      "name": "Assign Session (6hr Window)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1580,
+        480
+      ],
+      "notes": "Deterministic session assignment based on 6-hour time windows. Same photo always maps to same session."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Upsert the session (create if new, update if exists)\nINSERT INTO hangout_sessions (id, session_name, started_at, ended_at, media_count, friends_present)\nVALUES (\n  uuid_generate_v5(uuid_ns_url(), '{{ $json.sessionKey }}'),\n  '{{ $json.sessionName }}',\n  '{{ $json.windowStart }}',\n  '{{ $json.windowEnd }}',\n  1,\n  ARRAY[{{ $json.friendsIdentified.map(f => \"'\" + f + \"'\").join(',') || \"''\" }}]::text[]\n)\nON CONFLICT (id) DO UPDATE SET\n  media_count = hangout_sessions.media_count + 1,\n  friends_present = (\n    SELECT ARRAY(SELECT DISTINCT unnest(\n      hangout_sessions.friends_present || \n      ARRAY[{{ $json.friendsIdentified.map(f => \"'\" + f + \"'\").join(',') || \"''\" }}]::text[]\n    ))\n  ),\n  updated_at = NOW()\nRETURNING id;",
+        "options": {}
+      },
+      "id": "upsert-session",
+      "name": "Upsert Session",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1800,
+        480
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_POSTGRES_CRED_ID",
+          "name": "AutoSharePics DB"
+        }
+      },
+      "notes": "Creates session if new, or updates existing session with new friend list and incremented media count."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE media_files SET\n  faces_detected = {{ $json.facesDetected || 0 }},\n  faces_recognized = '{{ $json.facesRecognized }}'::jsonb,\n  friends_identified = ARRAY[{{ $json.friendsIdentified.map(f => \"'\" + f + \"'\").join(',') || '' }}]::text[],\n  session_id = uuid_generate_v5(uuid_ns_url(), '{{ $json.sessionKey }}'),\n  status = 'processed',\n  processed_at = NOW(),\n  process_attempts = process_attempts + 1,\n  updated_at = NOW()\nWHERE id = '{{ $json.mediaId }}'::uuid;",
+        "options": {}
+      },
+      "id": "update-media",
+      "name": "Update Media Record",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2020,
+        480
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_POSTGRES_CRED_ID",
+          "name": "AutoSharePics DB"
+        }
+      },
+      "notes": "Updates the media_files record with face recognition results, session assignment, and 'processed' status."
+    }
+  ],
+  "connections": {
+    "Called by Ingest Workflow": {
+      "main": [
+        [
+          {
+            "node": "Load Pending Media",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Catch-All Schedule (30 min)": {
+      "main": [
+        [
+          {
+            "node": "Load Pending Media",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Pending Media": {
+      "main": [
+        [
+          {
+            "node": "Is Video?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Video?": {
+      "main": [
+        [
+          {
+            "node": "Extract Video Keyframes",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Read Photo from Disk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Photo from Disk": {
+      "main": [
+        [
+          {
+            "node": "CompreFace: Recognize (Photo)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Video Keyframes": {
+      "main": [
+        [
+          {
+            "node": "Prepare Keyframe Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Keyframe Items": {
+      "main": [
+        [
+          {
+            "node": "CompreFace: Recognize (Video Frames)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CompreFace: Recognize (Video Frames)": {
+      "main": [
+        [
+          {
+            "node": "Parse Recognition Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CompreFace: Recognize (Photo)": {
+      "main": [
+        [
+          {
+            "node": "Parse Recognition Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Recognition Results": {
+      "main": [
+        [
+          {
+            "node": "Assign Session (6hr Window)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assign Session (6hr Window)": {
+      "main": [
+        [
+          {
+            "node": "Upsert Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Session": {
+      "main": [
+        [
+          {
+            "node": "Update Media Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "tags": [
+    {
+      "name": "AutoSharePics"
+    }
+  ],
+  "triggerCount": 2,
+  "id": "2"
+}
