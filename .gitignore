@@ -18,3 +18,10 @@ docker-compose.override.yml
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Audit deliverables that should NOT be committed
+.env.local
+.env.*.local
+backups/
+*.dump
+*.sql.gz

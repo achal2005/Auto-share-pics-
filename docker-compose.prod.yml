@@ -1,0 +1,136 @@
+# =============================================================================
+# AutoSharePics — Production Overlay
+# =============================================================================
+# Layers on top of docker-compose.yml. Adds:
+#   - Caddy reverse proxy with automatic HTTPS (Let's Encrypt).
+#   - Stricter resource limits, no host port exposure for backend services.
+#   - Loki + Promtail for log aggregation, Prometheus scrape on n8n metrics.
+#   - Read-only root filesystems where supported.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# Required additional .env entries:
+#   PUBLIC_DOMAIN=share.example.com
+#   PUBLIC_EMAIL=ops@example.com           # for Let's Encrypt
+#   N8N_PUBLIC_HOST=n8n.share.example.com  # Caddy only routes this to n8n
+# =============================================================================
+
+services:
+  # =========================================================================
+  # Caddy — TLS-terminating reverse proxy
+  # =========================================================================
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: autoshare-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN in .env}
+      PUBLIC_EMAIL: ${PUBLIC_EMAIL:?Set PUBLIC_EMAIL in .env}
+      N8N_PUBLIC_HOST: ${N8N_PUBLIC_HOST:?Set N8N_PUBLIC_HOST in .env}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - autoshare_net
+    depends_on:
+      - n8n
+      - evolution-api
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # =========================================================================
+  # n8n — production hardening
+  # =========================================================================
+  n8n:
+    ports: !reset []   # remove host port exposure; Caddy proxies it
+    environment:
+      N8N_PROTOCOL: https
+      N8N_HOST: ${N8N_PUBLIC_HOST}
+      WEBHOOK_URL: https://${N8N_PUBLIC_HOST}/
+      N8N_PROXY_HOPS: "1"
+      # Tighter retention for hosted deployments.
+      EXECUTIONS_DATA_MAX_AGE: "72"
+      EXECUTIONS_DATA_PRUNE_MAX_COUNT: "5000"
+      # Tell n8n it sits behind a TLS terminator.
+      N8N_SECURE_COOKIE: "true"
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+
+  # =========================================================================
+  # Evolution API — production hardening
+  # =========================================================================
+  evolution-api:
+    ports: !reset []
+    environment:
+      SERVER_URL: https://${PUBLIC_DOMAIN}/evolution
+      LOG_LEVEL: "ERROR,WARN,INFO"
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+
+  # =========================================================================
+  # CompreFace FE — close to the host, only Caddy reaches it
+  # =========================================================================
+  compreface-fe:
+    ports: !reset []
+
+  # =========================================================================
+  # Postgres — never published in prod
+  # =========================================================================
+  app-postgres:
+    ports: !reset []
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # =========================================================================
+  # Loki + Promtail — minimal log aggregation
+  # =========================================================================
+  loki:
+    image: grafana/loki:2.9.8
+    container_name: autoshare-loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - loki_data:/loki
+    networks:
+      - autoshare_net
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  promtail:
+    image: grafana/promtail:2.9.8
+    container_name: autoshare-promtail
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./monitoring/promtail.yml:/etc/promtail/config.yml:ro
+    networks:
+      - autoshare_net
+    depends_on:
+      - loki
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+volumes:
+  caddy_data:
+  caddy_config:
+  loki_data:

@@ -1,396 +1,263 @@
 #!/usr/bin/env node
-// ============================================================================
-// AutoSharePics - CompreFace Setup Script
-// ============================================================================
-// This script:
-//   1. Creates a recognition service in CompreFace (if not exists)
-//   2. Uploads reference photos for each friend ("subject")
-//   3. Tests recognition accuracy
-//
-// Usage:
-//   node scripts/setup-compreface.js --action=upload --friend=alice --photos=./reference_photos/alice/
-//   node scripts/setup-compreface.js --action=test --photo=./test_photo.jpg
-//   node scripts/setup-compreface.js --action=list
-//
-// Prerequisites:
-//   npm install axios form-data fs-extra glob yargs
-// ============================================================================
+// =============================================================================
+// AutoSharePics — CompreFace Setup CLI (audited rewrite)
+// =============================================================================
+// Fixes from the audit:
+//   - glob v9+ API: `glob` is now a named export, options changed.
+//   - Adds 429 / 5xx retry with exponential backoff.
+//   - Lowercases subject names consistently with the DB CHECK constraint.
+//   - HEIC -> JPEG fallback for iPhone references via heic-convert.
+//   - Verifies the friend has at least N usable embeddings before declaring
+//     them "ready" (CompreFace requires multiple distinct faces to disambiguate
+//     in small databases — reduces the false-positive risk that's high when
+//     only 2-5 friends are enrolled).
+// =============================================================================
 
 const axios = require('axios');
 const FormData = require('form-data');
 const fs = require('fs-extra');
 const path = require('path');
 const { glob } = require('glob');
+let heicConvert = null; try { heicConvert = require('heic-convert'); } catch {}
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
 const CONFIG = {
-    // CompreFace API endpoint (admin portal serves the recognition API too)
-    apiUrl: process.env.CF_API_URL || 'http://localhost:8000',
-    // Recognition API key (get from CompreFace admin UI after creating a service)
-    apiKey: process.env.CF_RECOGNITION_API_KEY || '',
-    // Supported image formats
-    supportedFormats: ['.jpg', '.jpeg', '.png', '.bmp', '.tiff'],
-    // Face detection parameters
-    detProbThreshold: 0.8,    // Minimum face detection confidence
-    facePlugins: 'landmarks,gender,age',  // Extra data to extract
-    // FIX #6: Add faceDetectLimit parameter
-    faceDetectLimit: process.env.FACE_DETECT_LIMIT || 10,
+  apiUrl: process.env.CF_API_URL || 'http://localhost:8000',
+  apiKey: process.env.CF_RECOGNITION_API_KEY || '',
+  supportedFormats: ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.heic', '.heif'],
+  detProbThreshold: 0.8,
+  facePlugins: 'landmarks,gender,age',
+  maxRetries: 5,
+  retryBaseDelayMs: 800,
+  minEmbeddingsForReady: 5,
+  uploadDelayMs: 250,
 };
 
-// ---------------------------------------------------------------------------
-// Helper: Make API request to CompreFace
-// ---------------------------------------------------------------------------
-async function compreRequest(method, endpoint, data = null, isFormData = false) {
-    const url = `${CONFIG.apiUrl}/api/v1/recognition${endpoint}`;
-    const headers = {
-        'x-api-key': CONFIG.apiKey,
-    };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-    if (isFormData) {
-        Object.assign(headers, data.getHeaders());
-    }
+async function compreRequest(method, endpoint, data = null, isFormData = false, attempt = 1) {
+  const url = `${CONFIG.apiUrl}/api/v1/recognition${endpoint}`;
+  const headers = { 'x-api-key': CONFIG.apiKey };
+  if (isFormData && data) Object.assign(headers, data.getHeaders());
 
-    try {
-        const response = await axios({
-            method,
-            url,
-            data,
-            headers,
-            maxContentLength: Infinity,
-            maxBodyLength: Infinity,
-        });
-        return response.data;
-    } catch (error) {
-        if (error.response) {
-            console.error(`❌ API Error (${error.response.status}):`, error.response.data);
-        } else {
-            console.error(`❌ Network Error:`, error.message);
-        }
-        throw error;
+  try {
+    const response = await axios({
+      method, url, data, headers,
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+      timeout: 60000,
+      validateStatus: (s) => s < 500 && s !== 429,
+    });
+    return response.data;
+  } catch (error) {
+    const status = error.response?.status;
+    const retryable = status === 429 || (status >= 500 && status < 600) || error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT';
+    if (retryable && attempt < CONFIG.maxRetries) {
+      const delay = CONFIG.retryBaseDelayMs * 2 ** (attempt - 1) + Math.floor(Math.random() * 200);
+      console.warn(`   retry ${attempt}/${CONFIG.maxRetries} after ${delay}ms (status=${status || error.code})`);
+      await sleep(delay);
+      return compreRequest(method, endpoint, data, isFormData, attempt + 1);
     }
+    if (error.response) {
+      console.error(`   API Error ${error.response.status}:`, JSON.stringify(error.response.data));
+    } else {
+      console.error('   Network Error:', error.message);
+    }
+    throw error;
+  }
 }
 
-// ---------------------------------------------------------------------------
-// ACTION: List all registered subjects (friends)
-// ---------------------------------------------------------------------------
+async function maybeConvertHeic(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext !== '.heic' && ext !== '.heif') return { stream: fs.createReadStream(filePath), filename: path.basename(filePath) };
+  if (!heicConvert) {
+    throw new Error(`HEIC file ${path.basename(filePath)} requires heic-convert. Install: npm i heic-convert`);
+  }
+  const buf = await heicConvert({ buffer: await fs.readFile(filePath), format: 'JPEG', quality: 0.9 });
+  return { stream: buf, filename: path.basename(filePath, ext) + '.jpg' };
+}
+
 async function listSubjects() {
-    console.log('\n📋 Listing all registered subjects...\n');
-
-    const result = await compreRequest('GET', '/subjects');
-    const subjects = result.subjects || [];
-
-    if (subjects.length === 0) {
-        console.log('  (none) — No subjects registered yet.');
-        console.log('  Run with --action=upload to add friends.\n');
-        return;
-    }
-
-    console.log(`  Found ${subjects.length} subject(s):\n`);
-
-    for (const subject of subjects) {
-        // Get face count for each subject
-        try {
-            const faces = await compreRequest('GET', `/faces?subject=${encodeURIComponent(subject)}`);
-            const count = faces.faces ? faces.faces.length : 0;
-            console.log(`  👤 ${subject} — ${count} reference photo(s)`);
-        } catch {
-            console.log(`  👤 ${subject} — (couldn't fetch face count)`);
-        }
-    }
-    console.log('');
-}
-
-// ---------------------------------------------------------------------------
-// ACTION: Upload reference photos for a friend
-// ---------------------------------------------------------------------------
-async function uploadFaces(friendName, photosDir) {
-    console.log(`\n📸 Uploading reference photos for "${friendName}"...`);
-    console.log(`   Source directory: ${photosDir}\n`);
-
-    // Verify directory exists
-    if (!await fs.pathExists(photosDir)) {
-        console.error(`❌ Directory not found: ${photosDir}`);
-        console.error(`   Create it and add 5-15 clear photos of ${friendName}'s face.`);
-        process.exit(1);
-    }
-
-    // Find all image files
-    const patterns = CONFIG.supportedFormats.map(ext => path.join(photosDir, `*${ext}`));
-    let imageFiles = [];
-    for (const pattern of patterns) {
-        // FIX #13: Make windowsPathsNoEscape conditional
-        const matches = await glob(pattern, { nocase: true, windowsPathsNoEscape: process.platform === 'win32' });
-        imageFiles.push(...matches);
-    }
-
-    if (imageFiles.length === 0) {
-        console.error(`❌ No image files found in ${photosDir}`);
-        console.error(`   Supported formats: ${CONFIG.supportedFormats.join(', ')}`);
-        process.exit(1);
-    }
-
-    console.log(`   Found ${imageFiles.length} image(s) to upload.\n`);
-
-    // Quality recommendations
-    if (imageFiles.length < 5) {
-        console.log('   ⚠️  Recommendation: Use at least 5 reference photos for good accuracy.');
-        console.log('       Include different angles, lighting, and expressions.\n');
-    }
-    if (imageFiles.length > 20) {
-        console.log('   💡 Tip: More than 20 photos may not improve accuracy significantly.');
-        console.log('       Quality > quantity. Diverse angles matter more.\n');
-    }
-
-    // Upload each photo
-    let successCount = 0;
-    let failCount = 0;
-
-    for (let i = 0; i < imageFiles.length; i++) {
-        const filePath = imageFiles[i];
-        const fileName = path.basename(filePath);
-
-        process.stdout.write(`   [${i + 1}/${imageFiles.length}] ${fileName}... `);
-
-        try {
-            const form = new FormData();
-            form.append('file', fs.createReadStream(filePath));
-
-            const result = await compreRequest(
-                'POST',
-                `/faces?subject=${encodeURIComponent(friendName)}&det_prob_threshold=${CONFIG.detProbThreshold}`,
-                form,
-                true
-            );
-
-            if (result.image_id) {
-                console.log(`✅ (image_id: ${result.image_id.substring(0, 8)}...)`);
-                successCount++;
-            } else {
-                console.log('⚠️  Uploaded but no face detected');
-                failCount++;
-            }
-        } catch (error) {
-            console.log('❌ Failed');
-            failCount++;
-        }
-
-        // Small delay to not overwhelm the API
-        await new Promise(r => setTimeout(r, 500));
-    }
-
-    console.log(`\n   📊 Results: ${successCount} succeeded, ${failCount} failed`);
-    console.log(`   Subject "${friendName}" is ${successCount > 0 ? 'ready' : 'NOT ready'} for recognition.\n`);
-}
-
-// ---------------------------------------------------------------------------
-// ACTION: Test face recognition on a photo
-// ---------------------------------------------------------------------------
-async function testRecognition(photoPath, threshold = 0.85) {
-    console.log(`\n🧪 Testing face recognition...`);
-    console.log(`   Photo: ${photoPath}`);
-    console.log(`   Threshold: ${threshold}\n`);
-
-    if (!await fs.pathExists(photoPath)) {
-        console.error(`❌ File not found: ${photoPath}`);
-        process.exit(1);
-    }
-
-    const form = new FormData();
-    form.append('file', fs.createReadStream(photoPath));
-
-    const result = await compreRequest(
-        'POST',
-        // FIX #6: Replace limit=0 with limit=${CONFIG.faceDetectLimit}
-        `/recognize?limit=${CONFIG.faceDetectLimit}&det_prob_threshold=${CONFIG.detProbThreshold}&prediction_count=3&face_plugins=${CONFIG.facePlugins}`,
-        form,
-        true
-    );
-
-    if (!result.result || result.result.length === 0) {
-        console.log('   ⚠️  No faces detected in this photo.\n');
-        return;
-    }
-
-    console.log(`   Found ${result.result.length} face(s):\n`);
-
-    for (let i = 0; i < result.result.length; i++) {
-        const face = result.result[i];
-        const box = face.box;
-        const subjects = face.subjects || [];
-
-        console.log(`   ┌─ Face #${i + 1} ──────────────────────────────`);
-        console.log(`   │ Location:   (${box.x_min}, ${box.y_min}) → (${box.x_max}, ${box.y_max})`);
-        console.log(`   │ Detection:  ${(box.probability * 100).toFixed(1)}% confidence`);
-
-        if (face.gender) {
-            console.log(`   │ Gender:     ${face.gender.value} (${(face.gender.probability * 100).toFixed(0)}%)`);
-        }
-        if (face.age) {
-            console.log(`   │ Age:        ~${face.age.low}-${face.age.high}`);
-        }
-
-        if (subjects.length === 0) {
-            console.log(`   │ Match:      ❓ Unknown person (no match above threshold)`);
-        } else {
-            for (const subj of subjects) {
-                const isMatch = subj.similarity >= threshold;
-                const icon = isMatch ? '✅' : '⚠️';
-                console.log(`   │ Match:      ${icon} ${subj.subject} (${(subj.similarity * 100).toFixed(1)}% similarity)`);
-            }
-        }
-        console.log(`   └────────────────────────────────────────\n`);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ACTION: Delete a subject and all their reference photos
-// ---------------------------------------------------------------------------
-async function deleteSubject(friendName) {
-    console.log(`\n🗑️  Deleting subject "${friendName}" and all reference photos...`);
-
+  console.log('\nListing all registered subjects...\n');
+  const result = await compreRequest('GET', '/subjects');
+  const subjects = result.subjects || [];
+  if (!subjects.length) {
+    console.log('  (none)\n');
+    return;
+  }
+  for (const subject of subjects) {
     try {
-        await compreRequest('DELETE', `/subjects/${encodeURIComponent(friendName)}`);
-        console.log(`   ✅ Subject "${friendName}" deleted.\n`);
-    } catch (error) {
-        console.log(`   ❌ Failed to delete. Subject may not exist.\n`);
+      const faces = await compreRequest('GET', `/faces?subject=${encodeURIComponent(subject)}`);
+      const count = faces.faces?.length || 0;
+      const ok = count >= CONFIG.minEmbeddingsForReady;
+      console.log(`  ${ok ? 'OK ' : '!! '} ${subject} — ${count} reference photo(s)${ok ? '' : ` (need >= ${CONFIG.minEmbeddingsForReady})`}`);
+    } catch {
+      console.log(`  ?? ${subject} — (could not fetch face count)`);
     }
+  }
+  console.log('');
 }
 
-// ---------------------------------------------------------------------------
-// ACTION: Bulk upload from a structured directory
-// ---------------------------------------------------------------------------
-// Expected structure:
-//   reference_photos/
-//     alice/
-//       photo1.jpg
-//       photo2.jpg
-//     bob/
-//       photo1.jpg
-//       photo2.jpg
-// ---------------------------------------------------------------------------
-async function bulkUpload(baseDir) {
-    console.log(`\n📦 Bulk uploading from ${baseDir}...\n`);
+async function uploadFaces(friendName, photosDir) {
+  const subject = friendName.toLowerCase();
+  console.log(`\nUploading reference photos for "${subject}"...`);
+  console.log(`Source: ${photosDir}\n`);
 
-    if (!await fs.pathExists(baseDir)) {
-        console.error(`❌ Directory not found: ${baseDir}`);
-        process.exit(1);
-    }
-
-    const entries = await fs.readdir(baseDir, { withFileTypes: true });
-    const friendDirs = entries.filter(e => e.isDirectory());
-
-    if (friendDirs.length === 0) {
-        console.error('❌ No subdirectories found. Expected structure:');
-        console.error('   reference_photos/alice/, reference_photos/bob/, etc.');
-        process.exit(1);
-    }
-
-    console.log(`   Found ${friendDirs.length} friend folder(s): ${friendDirs.map(d => d.name).join(', ')}\n`);
-
-    for (const dir of friendDirs) {
-        const friendName = dir.name.toLowerCase();
-        const friendPath = path.join(baseDir, dir.name);
-        await uploadFaces(friendName, friendPath);
-    }
-
-    console.log('\n✅ Bulk upload complete! Run --action=list to verify.\n');
-}
-
-// ---------------------------------------------------------------------------
-// CLI Entry Point
-// ---------------------------------------------------------------------------
-async function main() {
-    const args = require('yargs')
-        .usage('Usage: $0 --action=<action> [options]')
-        .option('action', {
-            alias: 'a',
-            describe: 'Action to perform',
-            choices: ['upload', 'bulk', 'test', 'list', 'delete'],
-            demandOption: true,
-        })
-        .option('friend', {
-            alias: 'f',
-            describe: 'Friend name (subject) for upload/delete',
-            type: 'string',
-        })
-        .option('photos', {
-            alias: 'p',
-            describe: 'Path to photos directory (upload) or single photo (test)',
-            type: 'string',
-        })
-        .option('photo', {
-            describe: 'Path to a single photo for testing',
-            type: 'string',
-        })
-        .option('dir', {
-            alias: 'd',
-            describe: 'Base directory for bulk upload (contains friend subdirectories)',
-            type: 'string',
-            default: './reference_photos',
-        })
-        .option('threshold', {
-            alias: 't',
-            describe: 'Confidence threshold for recognition (0.0 - 1.0)',
-            type: 'number',
-            default: 0.85,
-        })
-        .option('api-key', {
-            describe: 'CompreFace API key (or set CF_RECOGNITION_API_KEY env var)',
-            type: 'string',
-        })
-        .help()
-        .argv;
-
-    // Override API key if provided via CLI
-    if (args['api-key']) {
-        CONFIG.apiKey = args['api-key'];
-    }
-
-    if (!CONFIG.apiKey) {
-        console.error('\n❌ No API key provided!');
-        console.error('   Set CF_RECOGNITION_API_KEY environment variable, or pass --api-key=<key>');
-        console.error('   Get your API key from CompreFace admin UI: http://localhost:8000\n');
-        process.exit(1);
-    }
-
-    switch (args.action) {
-        case 'list':
-            await listSubjects();
-            break;
-
-        case 'upload':
-            if (!args.friend || !args.photos) {
-                console.error('❌ --friend and --photos are required for upload action');
-                process.exit(1);
-            }
-            await uploadFaces(args.friend, args.photos);
-            break;
-
-        case 'bulk':
-            await bulkUpload(args.dir);
-            break;
-
-        case 'test':
-            if (!args.photo) {
-                console.error('❌ --photo is required for test action');
-                process.exit(1);
-            }
-            await testRecognition(args.photo, args.threshold);
-            break;
-
-        case 'delete':
-            if (!args.friend) {
-                console.error('❌ --friend is required for delete action');
-                process.exit(1);
-            }
-            await deleteSubject(args.friend);
-            break;
-    }
-}
-
-main().catch(error => {
-    console.error('\n💥 Unexpected error:', error.message);
+  if (!await fs.pathExists(photosDir)) {
+    console.error(`Directory not found: ${photosDir}`);
     process.exit(1);
+  }
+
+  const patterns = CONFIG.supportedFormats.map((ext) => path.posix.join(photosDir.replace(/\\/g, '/'), `*${ext}`));
+  const imageFiles = [];
+  for (const pattern of patterns) {
+    const matches = await glob(pattern, { nocase: true, windowsPathsNoEscape: true });
+    imageFiles.push(...matches);
+  }
+
+  if (!imageFiles.length) {
+    console.error(`No image files found in ${photosDir}`);
+    console.error(`Supported: ${CONFIG.supportedFormats.join(', ')}`);
+    process.exit(1);
+  }
+
+  console.log(`Found ${imageFiles.length} image(s).`);
+  if (imageFiles.length < CONFIG.minEmbeddingsForReady) {
+    console.log(`WARNING: ${imageFiles.length} < ${CONFIG.minEmbeddingsForReady}. Add more photos for reliable recognition.`);
+  }
+
+  let success = 0, fail = 0;
+  for (let i = 0; i < imageFiles.length; i++) {
+    const filePath = imageFiles[i];
+    const fileName = path.basename(filePath);
+    process.stdout.write(`  [${i + 1}/${imageFiles.length}] ${fileName} ... `);
+    try {
+      const { stream, filename } = await maybeConvertHeic(filePath);
+      const form = new FormData();
+      form.append('file', stream, { filename });
+      const result = await compreRequest(
+        'POST',
+        `/faces?subject=${encodeURIComponent(subject)}&det_prob_threshold=${CONFIG.detProbThreshold}`,
+        form, true,
+      );
+      if (result.image_id) {
+        console.log(`ok (${result.image_id.slice(0, 8)})`);
+        success++;
+      } else {
+        console.log('uploaded but no face detected');
+        fail++;
+      }
+    } catch {
+      console.log('failed');
+      fail++;
+    }
+    await sleep(CONFIG.uploadDelayMs);
+  }
+
+  const ready = success >= CONFIG.minEmbeddingsForReady;
+  console.log(`\nResults: ${success} succeeded, ${fail} failed`);
+  console.log(`Subject "${subject}" is ${ready ? 'READY' : 'NOT YET READY'} for recognition.\n`);
+  if (!ready) process.exitCode = 1;
+}
+
+async function testRecognition(photoPath, threshold) {
+  console.log(`\nTesting recognition on ${photoPath} (threshold=${threshold})\n`);
+  if (!await fs.pathExists(photoPath)) {
+    console.error(`File not found: ${photoPath}`);
+    process.exit(1);
+  }
+  const { stream, filename } = await maybeConvertHeic(photoPath);
+  const form = new FormData();
+  form.append('file', stream, { filename });
+  const result = await compreRequest(
+    'POST',
+    `/recognize?limit=0&det_prob_threshold=${CONFIG.detProbThreshold}&prediction_count=3&face_plugins=${CONFIG.facePlugins}`,
+    form, true,
+  );
+  if (!result.result?.length) {
+    console.log('No faces detected.\n');
+    return;
+  }
+  console.log(`Found ${result.result.length} face(s):`);
+  result.result.forEach((face, i) => {
+    const subjects = face.subjects || [];
+    console.log(`\n  Face #${i + 1}: detection=${(face.box.probability * 100).toFixed(1)}%`);
+    if (!subjects.length) {
+      console.log('    -> Unknown');
+    } else {
+      subjects.forEach((s) => {
+        const m = s.similarity >= threshold;
+        console.log(`    ${m ? 'MATCH' : 'below'} ${s.subject}: ${(s.similarity * 100).toFixed(1)}%`);
+      });
+    }
+  });
+  console.log('');
+}
+
+async function deleteSubject(friendName) {
+  const subject = friendName.toLowerCase();
+  console.log(`\nDeleting subject "${subject}"...`);
+  try {
+    await compreRequest('DELETE', `/subjects/${encodeURIComponent(subject)}`);
+    console.log('Deleted.\n');
+  } catch {
+    console.log('Failed to delete (subject may not exist).\n');
+  }
+}
+
+async function bulkUpload(baseDir) {
+  console.log(`\nBulk uploading from ${baseDir}\n`);
+  if (!await fs.pathExists(baseDir)) {
+    console.error(`Directory not found: ${baseDir}`);
+    process.exit(1);
+  }
+  const entries = await fs.readdir(baseDir, { withFileTypes: true });
+  const friendDirs = entries.filter((e) => e.isDirectory());
+  if (!friendDirs.length) {
+    console.error('No friend subdirectories found.');
+    process.exit(1);
+  }
+  console.log(`Found ${friendDirs.length} folder(s): ${friendDirs.map((d) => d.name).join(', ')}\n`);
+  for (const dir of friendDirs) {
+    await uploadFaces(dir.name, path.join(baseDir, dir.name));
+  }
+  console.log('\nBulk upload complete. Run --action=list to verify.\n');
+}
+
+async function main() {
+  const args = require('yargs')
+    .usage('Usage: $0 --action=<action> [options]')
+    .option('action', { alias: 'a', choices: ['upload', 'bulk', 'test', 'list', 'delete'], demandOption: true })
+    .option('friend', { alias: 'f', type: 'string' })
+    .option('photos', { alias: 'p', type: 'string' })
+    .option('photo', { type: 'string' })
+    .option('dir', { alias: 'd', type: 'string', default: './reference_photos' })
+    .option('threshold', { alias: 't', type: 'number', default: 0.85 })
+    .option('api-key', { type: 'string' })
+    .help()
+    .argv;
+
+  if (args['api-key']) CONFIG.apiKey = args['api-key'];
+  if (!CONFIG.apiKey) {
+    console.error('No API key. Set CF_RECOGNITION_API_KEY or pass --api-key=<key>');
+    process.exit(1);
+  }
+
+  switch (args.action) {
+    case 'list':   return listSubjects();
+    case 'upload':
+      if (!args.friend || !args.photos) { console.error('--friend and --photos required'); process.exit(1); }
+      return uploadFaces(args.friend, args.photos);
+    case 'bulk':   return bulkUpload(args.dir);
+    case 'test':
+      if (!args.photo) { console.error('--photo required'); process.exit(1); }
+      return testRecognition(args.photo, args.threshold);
+    case 'delete':
+      if (!args.friend) { console.error('--friend required'); process.exit(1); }
+      return deleteSubject(args.friend);
+  }
+}
+
+main().catch((err) => {
+  console.error('\nUnexpected error:', err.message);
+  process.exit(1);
 });

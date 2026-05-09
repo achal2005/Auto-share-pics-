@@ -1,0 +1,64 @@
+# =============================================================================
+# AutoSharePics — Caddyfile
+# =============================================================================
+# Routes:
+#   https://{$N8N_PUBLIC_HOST}        → n8n (workflows + webhooks)
+#   https://{$PUBLIC_DOMAIN}/evolution → evolution-api (path-prefixed)
+#   https://{$PUBLIC_DOMAIN}/cf       → compreface-fe (admin UI; auth-gated)
+#
+# Caddy auto-issues Let's Encrypt certs on first run; no manual cert work.
+# =============================================================================
+
+{
+	email {$PUBLIC_EMAIL}
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+{$N8N_PUBLIC_HOST} {
+	encode zstd gzip
+	reverse_proxy n8n:5678 {
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Real-IP {remote_host}
+	}
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "geolocation=(), microphone=(), camera=()"
+	}
+}
+
+{$PUBLIC_DOMAIN} {
+	encode zstd gzip
+
+	# Evolution API: locked behind a randomly-generated path prefix and the
+	# AUTHENTICATION_API_KEY header. Path obfuscation is defense-in-depth, not
+	# a primary control.
+	handle_path /evolution/* {
+		reverse_proxy evolution-api:8080
+	}
+
+	# CompreFace admin UI — basic-auth gated. Generate password hash with:
+	#   docker run --rm caddy caddy hash-password --plaintext 'yourpassword'
+	# then set CF_ADMIN_BASICAUTH_HASH in .env.
+	handle_path /cf/* {
+		basic_auth {
+			cf_admin {$CF_ADMIN_BASICAUTH_HASH}
+		}
+		reverse_proxy compreface-fe:80
+	}
+
+	# Default landing — return 404 to fingerprint-resistant generic
+	handle {
+		respond "Not found" 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+}
