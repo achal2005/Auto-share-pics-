@@ -1109,3 +1109,4 @@ INFO   [ChannelStartupService]  [string]  Group Ignore: false
 
 **Goal:**
 We need a robust solution to get Evolution API (either v2.2.0 or v2.1.1) to successfully start the Baileys session and generate the pairing QR code on a Windows WSL2 Docker backend, without getting trapped in the `ChannelStartupService` restart loop.
+kuda
