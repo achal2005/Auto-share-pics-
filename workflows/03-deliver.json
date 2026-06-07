@@ -19,7 +19,7 @@
         200
       ],
       "webhookId": "geofence-trigger",
-      "notes": "iOS Shortcuts POSTs here when you arrive home. URL: {WEBHOOK_URL}/webhook/geofence-trigger"
+      "notes": "iOS Shortcuts POSTs here when you arrive home."
     },
     {
       "parameters": {
@@ -36,11 +36,12 @@
         400
       ],
       "webhookId": "manual-send",
-      "notes": "Manual trigger via POST request or WhatsApp command. URL: {WEBHOOK_URL}/webhook/manual-send"
+      "notes": "Manual trigger via POST request or WhatsApp command."
     },
     {
       "parameters": {
-        "jsCode": "// ============================================================\n// Validate Webhook & Apply Debounce\n// ============================================================\n// 1. Check webhook secret token for geofence trigger\n// 2. Wait 5 minutes for Google Drive sync to complete\n// 3. Merge triggers from both webhook sources\n// ============================================================\n\nconst item = $input.first();\nconst headers = item.json.headers || {};\nconst body = item.json.body || item.json;\n\n// Validate secret token (skip for manual trigger)\nconst expectedSecret = $env.GEOFENCE_WEBHOOK_SECRET || '';\nconst providedSecret = headers['x-webhook-secret'] || body.secret || '';\n\nif (expectedSecret && providedSecret !== expectedSecret) {\n  throw new Error('Invalid webhook secret. Rejecting request.');\n}\n\n// Debounce: this is handled by the Wait node that follows\nreturn [{ json: { triggerType: body.trigger || 'geofence', timestamp: new Date().toISOString() } }];"
+        "jsCode": "const item = $input.first() || { json: {} };\nconst headers = item.json.headers || {};\nconst body = item.json.body || item.json || {};\n\n// Determine trigger type: explicit body.trigger, or default to manual\nconst triggerType = body.trigger || 'manual';\n\nif (triggerType === 'geofence') {\n  const expectedSecret = $env.GEOFENCE_WEBHOOK_SECRET || '';\n  const providedSecret = headers['x-webhook-secret'] || body.secret || '';\n  if (expectedSecret && providedSecret !== expectedSecret) {\n    throw new Error('Invalid webhook secret. Rejecting request.');\n  }\n}\n\nreturn [{ json: { triggerType, timestamp: new Date().toISOString() } }];",
+        "mode": "runOnceForAllItems"
       },
       "id": "validate-trigger",
       "name": "Validate & Prepare",
@@ -65,12 +66,12 @@
         680,
         300
       ],
-      "notes": "Gives Google Drive time to finish syncing photos from your phone before we query for undelivered media."
+      "notes": "Gives Google Drive time to sync."
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "SELECT \n  m.id AS media_id,\n  m.original_filename,\n  m.local_path,\n  m.is_video,\n  m.friends_identified,\n  m.faces_recognized,\n  m.session_id,\n  s.session_name,\n  array_length(m.friends_identified, 1) AS friend_count\nFROM media_files m\nLEFT JOIN hangout_sessions s ON m.session_id = s.id\nWHERE m.status = 'processed'\n  AND NOT EXISTS (\n    SELECT 1 FROM delivery_logs dl \n    WHERE dl.media_file_id = m.id \n    AND dl.status IN ('sent', 'delivered', 'read')\n  )\nORDER BY m.taken_at ASC;",
+        "query": "SELECT m.id AS media_id, m.original_filename, m.local_path, m.is_video, m.friends_identified, m.faces_recognized, m.session_id, s.session_name, array_length(m.friends_identified, 1) AS friend_count FROM media_files m LEFT JOIN hangout_sessions s ON m.session_id = s.id WHERE m.status = 'processed' AND NOT EXISTS (SELECT 1 FROM delivery_logs dl WHERE dl.media_file_id = m.id AND dl.status IN ('sent', 'delivered', 'read')) ORDER BY m.taken_at ASC;",
         "options": {}
       },
       "id": "load-undelivered",
@@ -83,11 +84,11 @@
       ],
       "credentials": {
         "postgres": {
-          "id": "YOUR_POSTGRES_CRED_ID",
-          "name": "AutoSharePics DB"
+          "id": "iWcToZmpCj2t7uEW",
+          "name": "Postgres account"
         }
       },
-      "notes": "Fetches all processed media that hasn't been successfully delivered yet. Uses NOT EXISTS for deduplication safety."
+      "notes": "Fetches processed, undelivered media."
     },
     {
       "parameters": {
@@ -113,12 +114,12 @@
       "position": [
         1120,
         300
-      ],
-      "notes": "Filters out photos where no friends were recognized. Those go to a 'skipped' log."
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// ============================================================\n// Routing Logic: Group Chat vs DM\n// ============================================================\n// Rules:\n//   - 2+ friends detected → Send to GROUP chat\n//   - 1 friend detected → Send as DM to that friend\n//   - 0 friends → Skip (handled by previous node)\n//\n// For photos: sent as DOCUMENT (preserves full quality)\n// For videos: sent as normal MEDIA (WhatsApp compresses anyway)\n//\n// Output: adds routing instructions to each item\n// ============================================================\n\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const friends = item.json.friends_identified || [];\n  const friendCount = friends.length;\n  const isVideo = item.json.is_video;\n\n  if (friendCount >= 2) {\n    // GROUP CHAT: photo has 2+ friends\n    results.push({\n      json: {\n        ...item.json,\n        _routing: {\n          type: 'group',\n          recipientJid: $env.WHATSAPP_GROUP_JID,\n          recipientName: 'Squad Group',\n          sendAs: isVideo ? 'media' : 'document',\n          friends: friends,\n          caption: isVideo ? '' : `📸 ${friends.join(' & ')}`,\n        }\n      }\n    });\n  } else if (friendCount === 1) {\n    // DM: photo has exactly 1 friend\n    results.push({\n      json: {\n        ...item.json,\n        _routing: {\n          type: 'dm',\n          friendName: friends[0],\n          sendAs: isVideo ? 'media' : 'document',\n          friends: friends,\n          caption: '',\n        }\n      }\n    });\n  }\n}\n\nreturn results;"
+        "jsCode": "const items = $input.all();\nconst results = [];\nfor (const item of items) {\n  const friends = item.json.friends_identified || [];\n  const friendCount = friends.length;\n  const isVideo = item.json.is_video;\n  if (friendCount >= 2) {\n    results.push({ json: { ...item.json, _routing: { type: 'group', recipientJid: $env.WHATSAPP_GROUP_JID, recipientName: 'Squad Group', sendAs: isVideo ? 'media' : 'document', friends: friends, caption: isVideo ? '' : ('PIC ' + friends.join(' & ')) } } });\n  } else if (friendCount === 1) {\n    results.push({ json: { ...item.json, _routing: { type: 'dm', friendName: friends[0], sendAs: isVideo ? 'media' : 'document', friends: friends, caption: '' } } });\n  }\n}\nreturn results;",
+        "mode": "runOnceForAllItems"
       },
       "id": "routing-logic",
       "name": "Route: Group vs DM",
@@ -127,12 +128,12 @@
       "position": [
         1340,
         200
-      ],
-      "notes": "Core routing: 2+ friends → group, 1 friend → DM. Photos as documents, videos as media."
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// ============================================================\n// Contact Lookup\n// ============================================================\n// For DMs, we need to look up the friend's WhatsApp JID.\n// This queries the friends_contacts table.\n//\n// Alternative: Use Google Sheets lookup node if you prefer\n// managing contacts in a spreadsheet.\n// ============================================================\n\nconst item = $input.first();\nconst routing = item.json._routing;\n\nif (routing.type === 'group') {\n  // Group messages don't need contact lookup\n  return [{ json: item.json }];\n}\n\n// For DMs, the recipient JID will be set after DB lookup\nreturn [{\n  json: {\n    ...item.json,\n    _contactLookupNeeded: true,\n    _friendToLookup: routing.friendName ? routing.friendName.replace(/'/g, \"''\") : null,\n  }\n}];"
+        "jsCode": "const items = $input.all();\nconst results = [];\nfor (const item of items) {\n  const routing = item.json._routing;\n  if (routing.type === 'group') {\n    results.push({ json: item.json });\n  } else {\n    results.push({ json: { ...item.json, _contactLookupNeeded: true, _friendToLookup: routing.friendName ? routing.friendName.replace(/'/g, \"''\") : null } });\n  }\n}\nreturn results;",
+        "mode": "runOnceForAllItems"
       },
       "id": "contact-prep",
       "name": "Prepare Contact Lookup",
@@ -141,8 +142,7 @@
       "position": [
         1560,
         200
-      ],
-      "notes": "Prepares contact lookup for DM recipients."
+      ]
     },
     {
       "parameters": {
@@ -168,13 +168,12 @@
       "position": [
         1680,
         200
-      ],
-      "notes": "Splits group messages (which already have JID) from DMs (which need DB lookup)."
+      ]
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "SELECT whatsapp_jid, display_name, send_preference\nFROM friends_contacts\nWHERE subject_name = '{{ $json._friendToLookup || $json._routing.friendName }}'\n  AND is_active = true\n  AND consent_given = true\nLIMIT 1;",
+        "query": "SELECT subject_name, whatsapp_jid, display_name, send_preference FROM friends_contacts WHERE subject_name = '{{ $json._friendToLookup || $json._routing.friendName }}' AND is_active = true AND consent_given = true LIMIT 1;",
         "options": {}
       },
       "id": "lookup-contact",
@@ -187,15 +186,15 @@
       ],
       "credentials": {
         "postgres": {
-          "id": "YOUR_POSTGRES_CRED_ID",
-          "name": "AutoSharePics DB"
+          "id": "iWcToZmpCj2t7uEW",
+          "name": "Postgres account"
         }
-      },
-      "notes": "Looks up WhatsApp JID from friends_contacts. Only sends to active friends who gave consent."
+      }
     },
     {
       "parameters": {
-        "jsCode": "// ============================================================\n// Merge Contact Info & Build Send Payload\n// ============================================================\n// Combines routing decision with contact lookup results.\n// Builds the final payload for Evolution API.\n// ============================================================\n\nconst item = $input.first();\nconst routing = item.json._routing;\n\nlet recipientJid, recipientName;\n\nif (routing.type === 'group') {\n  recipientJid = routing.recipientJid;\n  recipientName = routing.recipientName;\n} else {\n  // DM — use looked-up contact\n  const contact = item.json;\n  recipientJid = contact.whatsapp_jid;\n  recipientName = contact.display_name || routing.friendName;\n  \n  if (!recipientJid) {\n    throw new Error(`No WhatsApp JID found for friend: ${routing.friendName}. Add them to friends_contacts table.`);\n  }\n  \n  // Check send preference\n  if (contact.send_preference === 'group_only') {\n    // This friend only wants group messages, skip DM\n    return [{ json: { ...item.json, _skip: true, _skipReason: 'Friend prefers group_only' } }];\n  }\n}\n\nreturn [{\n  json: {\n    mediaId: item.json.media_id || item.json.mediaId,\n    sessionId: item.json.session_id || item.json.sessionId,\n    localPath: item.json.local_path || item.json.localPath,\n    originalFilename: item.json.original_filename || item.json.originalFilename,\n    isVideo: item.json.is_video || item.json.isVideo,\n    recipientJid: recipientJid,\n    recipientName: recipientName,\n    recipientType: routing.type,\n    sendAs: routing.sendAs,\n    caption: routing.caption || '',\n    friends: routing.friends,\n  }\n}];"
+        "jsCode": "// ============================================================\n// Merge Contact Info & Build Send Payload\n// ============================================================\n// Inputs arrive on a single slot from two branches:\n//   * GROUP items  -> still carry `_routing` (straight from \"Is DM?\" false)\n//   * DM rows      -> raw Postgres rows (subject_name, whatsapp_jid,\n//                     display_name, send_preference). NO `_routing`.\n//\n// The Postgres node drops n8n pairedItem metadata, so itemMatching() is\n// unreliable (it can silently return the wrong row). We re-pair each DB row\n// to the next UNUSED original DM media item by the friend's raw name, so the\n// same friend appearing in several separate photos is paired correctly.\n// ============================================================\n\nconst items = $input.all();\n\n// Original DM media items, in order, still un-consumed.\nconst dmOriginals = $('Prepare Contact Lookup')\n  .all()\n  .filter(o => o.json && o.json._contactLookupNeeded === true);\nconst usedOriginal = new Set();\n\nconst results = [];\n\nfor (const item of items) {\n  const data = item.json;\n  let original;\n  let contact = null;\n\n  if (data._routing) {\n    // GROUP item: already complete.\n    original = data;\n  } else {\n    // DM contact row from Postgres -> re-pair to its media item by raw name.\n    contact = data;\n    const dbSubject = contact.subject_name;\n    const matchIdx = dmOriginals.findIndex(\n      (o, i) => !usedOriginal.has(i)\n        && o.json._routing\n        && o.json._routing.friendName === dbSubject\n    );\n    if (matchIdx === -1) {\n      throw new Error('Could not match DB contact back to a media file. Subject: ' + dbSubject);\n    }\n    usedOriginal.add(matchIdx);\n    original = dmOriginals[matchIdx].json;\n  }\n\n  const routing = original._routing;\n  let recipientJid, recipientName;\n\n  if (routing.type === 'group') {\n    recipientJid = routing.recipientJid;\n    recipientName = routing.recipientName;\n  } else {\n    recipientJid = contact.whatsapp_jid;\n    recipientName = contact.display_name || routing.friendName;\n\n    if (!recipientJid) {\n      throw new Error('No WhatsApp JID found for friend: ' + routing.friendName + '. Add them to friends_contacts.');\n    }\n\n    if (contact.send_preference === 'group_only') {\n      results.push({\n        json: {\n          mediaId: original.media_id !== undefined ? original.media_id : null,\n          _skip: true,\n          _skipReason: 'Friend prefers group_only'\n        }\n      });\n      continue;\n    }\n  }\n\n  results.push({\n    json: {\n      mediaId: original.media_id !== undefined ? original.media_id : null,\n      sessionId: original.session_id !== undefined ? original.session_id : null,\n      localPath: original.local_path || '',\n      originalFilename: original.original_filename || '',\n      isVideo: original.is_video !== undefined ? original.is_video : false,\n      recipientJid: recipientJid || null,\n      recipientName: recipientName || null,\n      recipientType: routing.type || null,\n      sendAs: routing.sendAs || null,\n      caption: routing.caption || '',\n      friends: routing.friends || []\n    }\n  });\n}\n\nreturn results;\n",
+        "mode": "runOnceForAllItems"
       },
       "id": "build-payload",
       "name": "Build Send Payload",
@@ -204,12 +203,12 @@
       "position": [
         2120,
         200
-      ],
-      "notes": "Merges routing + contact into final Evolution API payload. Respects send_preference."
+      ]
     },
     {
       "parameters": {
-        "jsCode": "// ============================================================\n// Human-like Delay (Ban Prevention)\n// ============================================================\n// WhatsApp monitors for bot-like behavior. We add random delays\n// between messages to appear more natural.\n//\n// Strategy:\n//   - Random delay between MIN and MAX ms per message\n//   - After every BATCH_SIZE messages, take a longer cooldown\n// ============================================================\n\nconst minDelay = parseInt($env.WA_MIN_DELAY_MS) || 3000;\nconst maxDelay = parseInt($env.WA_MAX_DELAY_MS) || 8000;\n\n// Random delay in this range\nconst delay = Math.floor(Math.random() * (maxDelay - minDelay)) + minDelay;\n\n// Sleep\nawait new Promise(resolve => setTimeout(resolve, delay));\n\nreturn $input.all();"
+        "jsCode": "// ============================================================\n// Human-like Delay + Batch Cooldown (Ban Prevention)\n// ============================================================\n// Runs once PER message so the static batch counter advances per send and\n// each send gets its own randomized delay; every BATCH_SIZE sends triggers a\n// longer cooldown.\n//\n// NOTE: n8n finishes this node for all items before \"Send via WhatsApp\" runs,\n// so this paces overall throughput / triggers cooldowns but does NOT interleave\n// the individual HTTP sends. For strict inter-send spacing, wrap this node and\n// \"Send via WhatsApp\" in a \"Loop Over Items\" (batch size 1) and feed the loop's\n// output back into this node.\n// ============================================================\n\nconst minDelay = parseInt($env.WA_MIN_DELAY_MS) || 4000;\nconst maxDelay = parseInt($env.WA_MAX_DELAY_MS) || 12000;\nconst batchSize = parseInt($env.WA_BATCH_SIZE) || 8;\nconst batchCooldown = parseInt($env.WA_BATCH_COOLDOWN_MS) || 180000;\n\nconst staticData = $getWorkflowStaticData('global');\nstaticData._batchCount = (staticData._batchCount || 0) + 1;\n\nif (staticData._batchCount > 1 && (staticData._batchCount - 1) % batchSize === 0) {\n  await new Promise(resolve => setTimeout(resolve, batchCooldown));\n} else {\n  const delay = Math.floor(Math.random() * (maxDelay - minDelay)) + minDelay;\n  await new Promise(resolve => setTimeout(resolve, delay));\n}\n\nreturn $input.item;\n",
+        "mode": "runOnceForEachItem"
       },
       "id": "rate-limit-delay",
       "name": "Rate Limit Delay",
@@ -218,8 +217,38 @@
       "position": [
         2340,
         200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "fileSelector": "={{ $json.localPath }}",
+        "options": {}
+      },
+      "id": "read-media-file",
+      "name": "Read Media File",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        2560,
+        200
       ],
-      "notes": "Random delay between 3-8 seconds per message. Critical for avoiding WhatsApp bans."
+      "notes": "Reads media file from cache volume as binary before sending."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Encode media to base64 and re-attach delivery metadata.\n// 'Read Media File' outputs binary only and drops the item JSON, and\n// $binary.data.data is NOT exposed as base64 in expressions on this n8n\n// build. We pull the buffer via the helper and merge back the metadata from\n// 'Rate Limit Delay' (1:1 item order is preserved through the file read).\nconst items = $input.all();\nconst meta = $('Rate Limit Delay').all();\nconst out = [];\nfor (let i = 0; i < items.length; i++) {\n  const buffer = await this.helpers.getBinaryDataBuffer(i, 'data');\n  out.push({\n    json: { ...meta[i].json, mediaBase64: buffer.toString('base64') },\n    pairedItem: { item: i }\n  });\n}\nreturn out;",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "encode-media",
+      "name": "Encode Media",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2670,
+        360
+      ],
+      "notes": "Reads binary reliably and re-attaches recipient/caption metadata the file-read node drops."
     },
     {
       "parameters": {
@@ -240,7 +269,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={\n  \"number\": \"{{ $json.recipientJid }}\",\n  \"options\": {\n    \"delay\": 1200,\n    \"presence\": \"composing\"\n  },\n  \"mediaMessage\": {\n    \"mediatype\": \"{{ $json.sendAs === 'document' ? 'document' : ($json.isVideo ? 'video' : 'image') }}\",\n    \"fileName\": \"{{ $json.originalFilename }}\",\n    \"caption\": \"{{ $json.caption || '' }}\",\n    \"media\": \"file:///evolution/media_cache/{{ $json.localPath.split('/').pop() }}\"\n  }\n}",
+        "jsonBody": "={{ {\n  \"number\": $json.recipientJid,\n  \"mediatype\": $json.sendAs === 'document' ? 'document' : ($json.isVideo ? 'video' : 'image'),\n  \"mimetype\": $json.isVideo ? 'video/mp4' : 'image/jpeg',\n  \"fileName\": $json.originalFilename,\n  \"caption\": $json.caption || '',\n  \"media\": $json.mediaBase64,\n  \"delay\": 1200\n} }}",
         "options": {
           "timeout": 60000
         }
@@ -250,41 +279,18 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        2560,
+        2780,
         200
-      ],
-      "notes": "Sends media via Evolution API. Photos as 'document' (full quality), videos as 'video' (normal). Uses 'composing' presence for human-like behavior."
+      ]
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO delivery_logs (\n  media_file_id,\n  session_id,\n  recipient_type,\n  recipient_jid,\n  recipient_name,\n  sent_as,\n  status,\n  whatsapp_msg_id,\n  sent_at\n) VALUES (\n  '{{ $json.mediaId }}'::uuid,\n  {{ $json.sessionId ? \"'\" + $json.sessionId + \"'::uuid\" : 'NULL' }},\n  '{{ $json.recipientType }}',\n  '{{ $json.recipientJid }}',\n  '{{ $json.recipientName }}',\n  '{{ $json.sendAs }}',\n  'sent',\n  '{{ $json.key?.id || $json.messageId || '' }}',\n  NOW()\n)\nON CONFLICT (media_file_id, recipient_jid) DO NOTHING;",
+        "query": "INSERT INTO delivery_logs (media_file_id, session_id, recipient_type, recipient_jid, recipient_name, sent_as, status, whatsapp_msg_id, sent_at, idempotency_key) SELECT '{{ $('Encode Media').item.json.mediaId }}'::uuid, {{ $('Encode Media').item.json.sessionId ? \"'\" + $('Encode Media').item.json.sessionId + \"'::uuid\" : 'NULL' }}, '{{ $('Encode Media').item.json.recipientType }}', '{{ $('Encode Media').item.json.recipientJid }}', '{{ $('Encode Media').item.json.recipientName }}', '{{ $('Encode Media').item.json.sendAs }}', 'sent', '{{ $json.key?.id || $json.messageId || '' }}', NOW(), '{{ $('Encode Media').item.json.mediaId }}:{{ $('Encode Media').item.json.recipientJid }}' WHERE NOT EXISTS (SELECT 1 FROM delivery_logs WHERE media_file_id = '{{ $('Encode Media').item.json.mediaId }}'::uuid AND recipient_jid = '{{ $('Encode Media').item.json.recipientJid }}' AND status IN ('sent', 'delivered', 'read'));",
         "options": {}
       },
       "id": "log-delivery",
       "name": "Log Delivery",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
-      "position": [
-        2780,
-        200
-      ],
-      "credentials": {
-        "postgres": {
-          "id": "YOUR_POSTGRES_CRED_ID",
-          "name": "AutoSharePics DB"
-        }
-      },
-      "notes": "Records successful delivery. ON CONFLICT prevents duplicate log entries."
-    },
-    {
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "UPDATE media_files SET status = 'delivered', delivered_at = NOW(), updated_at = NOW()\nWHERE id = '{{ $json.mediaId }}'::uuid;",
-        "options": {}
-      },
-      "id": "mark-delivered",
-      "name": "Mark as Delivered",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
@@ -293,25 +299,45 @@
       ],
       "credentials": {
         "postgres": {
-          "id": "YOUR_POSTGRES_CRED_ID",
-          "name": "AutoSharePics DB"
+          "id": "iWcToZmpCj2t7uEW",
+          "name": "Postgres account"
         }
-      },
-      "notes": "Updates media_files status to 'delivered'."
+      }
     },
     {
       "parameters": {
-        "jsCode": "// ============================================================\n// Generate Delivery Summary\n// ============================================================\n// After all media is sent, compile a summary message\n// to send to yourself via WhatsApp.\n// ============================================================\n\nconst items = $input.all();\nconst summary = {\n  totalSent: items.length,\n  groupMessages: items.filter(i => i.json.recipientType === 'group').length,\n  dmMessages: items.filter(i => i.json.recipientType === 'dm').length,\n  friends: [...new Set(items.flatMap(i => i.json.friends || []))],\n  timestamp: new Date().toISOString(),\n};\n\nconst summaryText = `📸 *AutoSharePics Summary*\\n\\n` +\n  `✅ Sent: ${summary.totalSent} file(s)\\n` +\n  `👥 Group: ${summary.groupMessages}\\n` +\n  `💬 DMs: ${summary.dmMessages}\\n` +\n  `👤 Friends: ${summary.friends.join(', ')}\\n` +\n  `🕐 ${new Date().toLocaleString('en-IN')}`;\n\nreturn [{ json: { summaryText, ...summary } }];"
+        "operation": "executeQuery",
+        "query": "UPDATE media_files SET status = 'delivered', delivered_at = NOW(), updated_at = NOW() WHERE id = '{{ $('Encode Media').item.json.mediaId }}'::uuid;",
+        "options": {}
+      },
+      "id": "mark-delivered",
+      "name": "Mark as Delivered",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3220,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "iWcToZmpCj2t7uEW",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $('Build Send Payload').all();\nconst sentItems = items.filter(i => !i.json._skip);\nconst summary = { totalSent: sentItems.length, groupMessages: sentItems.filter(i => i.json.recipientType === 'group').length, dmMessages: sentItems.filter(i => i.json.recipientType === 'dm').length, friends: [...new Set(sentItems.flatMap(i => i.json.friends || []))], timestamp: new Date().toISOString() };\nconst summaryText = 'AutoSharePics Summary\\n\\nSent: ' + summary.totalSent + '\\nGroup: ' + summary.groupMessages + '\\nDMs: ' + summary.dmMessages + '\\nFriends: ' + summary.friends.join(', ');\nreturn [{ json: { summaryText, ...summary } }];",
+        "mode": "runOnceForAllItems"
       },
       "id": "build-summary",
       "name": "Build Summary",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        3220,
+        3440,
         200
-      ],
-      "notes": "Compiles delivery stats into a summary message."
+      ]
     },
     {
       "parameters": {
@@ -332,7 +358,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={\n  \"number\": \"{{ $env.MY_WHATSAPP_NUMBER }}@s.whatsapp.net\",\n  \"options\": { \"delay\": 1000 },\n  \"textMessage\": {\n    \"text\": \"{{ $json.summaryText }}\"\n  }\n}",
+        "jsonBody": "={{ {\n  \"number\": $env.MY_WHATSAPP_NUMBER + '@s.whatsapp.net',\n  \"text\": $json.summaryText,\n  \"delay\": 1000\n} }}",
         "options": {}
       },
       "id": "send-summary",
@@ -340,15 +366,14 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        3440,
+        3660,
         200
-      ],
-      "notes": "Sends a WhatsApp message to yourself with the delivery summary."
+      ]
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE media_files SET status = 'skipped', updated_at = NOW()\nWHERE id = '{{ $json.media_id }}'::uuid AND status = 'processed';",
+        "query": "UPDATE media_files SET status = 'skipped', updated_at = NOW() WHERE id = '{{ $json.media_id }}'::uuid AND status = 'processed';",
         "options": {}
       },
       "id": "skip-no-friends",
@@ -361,11 +386,83 @@
       ],
       "credentials": {
         "postgres": {
-          "id": "YOUR_POSTGRES_CRED_ID",
-          "name": "AutoSharePics DB"
+          "id": "iWcToZmpCj2t7uEW",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {},
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json._skip }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
         }
       },
-      "notes": "Photos with no recognized friends are marked as 'skipped' so they're not reprocessed."
+      "id": "skip-message-check",
+      "name": "Skip Message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2230,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE media_files SET status = 'skipped', updated_at = NOW() WHERE id = '{{ $json.mediaId }}'::uuid AND status = 'processed';",
+        "options": {}
+      },
+      "id": "mark-skipped-preference",
+      "name": "Mark Skipped (Preference)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2340,
+        360
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "iWcToZmpCj2t7uEW",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {},
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.triggerType }}",
+              "rightValue": "manual",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      },
+      "id": "is-manual-trigger",
+      "name": "Is Manual Trigger?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        680,
+        150
+      ]
     }
   ],
   "connections": {
@@ -393,6 +490,24 @@
     },
     "Validate & Prepare": {
       "main": [
+        [
+          {
+            "node": "Is Manual Trigger?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Manual Trigger?": {
+      "main": [
+        [
+          {
+            "node": "Load Undelivered Media",
+            "type": "main",
+            "index": 0
+          }
+        ],
         [
           {
             "node": "Wait 5 min (Sync Buffer)",
@@ -497,6 +612,24 @@
       "main": [
         [
           {
+            "node": "Skip Message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip Message?": {
+      "main": [
+        [
+          {
+            "node": "Mark Skipped (Preference)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
             "node": "Rate Limit Delay",
             "type": "main",
             "index": 0
@@ -505,6 +638,28 @@
       ]
     },
     "Rate Limit Delay": {
+      "main": [
+        [
+          {
+            "node": "Read Media File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Media File": {
+      "main": [
+        [
+          {
+            "node": "Encode Media",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Encode Media": {
       "main": [
         [
           {
@@ -571,5 +726,6 @@
     }
   ],
   "triggerCount": 2,
-  "id": "3"
+  "id": "3",
+  "active": true
 }

@@ -19,9 +19,17 @@
 // =============================================================================
 
 const os = require('os');
-const REPLACEMENT_RELEASE = '10.0.22631';
-const REPLACEMENT_TYPE = 'Windows_NT';
-const REPLACEMENT_PLATFORM = 'win32';
+// CRITICAL: Evolution API v2.2.0 uses os.release() as the THIRD element of the
+// Baileys browser tuple: [CLIENT, NAME, os.release()]. WhatsApp expects a standard
+// OS release version (like '20.0.04' or '10.0'), NOT a WhatsApp Web version.
+// Having a mismatch like '2.24.6.77' as the OS release version triggers WhatsApp
+// anti-spam and drops the connection, causing a loop.
+const REPLACEMENT_RELEASE = '20.0.04';
+const REPLACEMENT_TYPE = 'Linux';
+// NOTE: We do NOT override os.platform(). It must remain 'linux' because
+// @ffmpeg-installer/ffmpeg and other native packages use it to find the
+// correct binary. Baileys only uses os.release() and os.type() for the
+// browser string.
 
 const safeOverride = (obj, prop, value) => {
   try {
@@ -39,27 +47,22 @@ const safeOverride = (obj, prop, value) => {
 
 safeOverride(os, 'release', () => REPLACEMENT_RELEASE);
 safeOverride(os, 'type', () => REPLACEMENT_TYPE);
+// os.platform() is intentionally NOT overridden — see note above.
 
-// Some Baileys forks read os.platform() to pick a Browsers preset. Forcing
-// win32 ensures Browsers.appropriate() emits ['Windows','Chrome',release()].
-const realPlatform = os.platform;
-safeOverride(os, 'platform', () => REPLACEMENT_PLATFORM);
-
-// process.platform is read by some libs; it's a getter on the process object
-// so we have to defineProperty.
-try {
-  Object.defineProperty(process, 'platform', {
-    value: REPLACEMENT_PLATFORM,
-    writable: false,
-    configurable: true,
-    enumerable: true,
-  });
-} catch (err) {
-  process.stderr.write(`[wsl2-patch] could not override process.platform: ${err.message}\n`);
+// Some Baileys forks also check os.version()
+if (typeof os.version === 'function') {
+  safeOverride(os, 'version', () => 'Ubuntu 20.04 LTS');
 }
+
+// Override os.hostname() to return a clean hostname (no WSL artifacts)
+const originalHostname = typeof os.hostname === 'function' ? os.hostname() : 'desktop';
+const cleanHostname = (originalHostname || 'desktop').split('.')[0].replace(/[^a-zA-Z0-9-]/g, '');
+safeOverride(os, 'hostname', () => cleanHostname);
 
 process.env.WSL2_PATCH_APPLIED = 'true';
 process.env.WSL2_PATCH_RELEASE = REPLACEMENT_RELEASE;
 process.stderr.write(
-  `[wsl2-patch] applied: os.release()='${REPLACEMENT_RELEASE}' platform='${REPLACEMENT_PLATFORM}' (real platform was '${realPlatform()}')\n`
+  `[wsl2-patch] applied: os.release()='${REPLACEMENT_RELEASE}', ` +
+  `os.type()='${REPLACEMENT_TYPE}', os.platform()='${os.platform()}' (not overridden), ` +
+  `os.hostname()='${cleanHostname}'\n`
 );

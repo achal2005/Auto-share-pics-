@@ -71,8 +71,6 @@ required('APP_DB_PASSWORD', { minLength: 16 });
 required('APP_DB_NAME');
 
 // ---------- n8n ----------
-required('N8N_AUTH_USER');
-required('N8N_AUTH_PASSWORD', { minLength: 16 });
 required('N8N_ENCRYPTION_KEY', { minLength: 32 });
 
 // ---------- CompreFace ----------
@@ -128,7 +126,7 @@ recommend('CF_IMG_LIMIT',
 
 // ---------- Detect dangerous duplicate secrets ----------
 const sensitiveKeys = [
-  'APP_DB_PASSWORD', 'CF_DB_PASSWORD', 'N8N_AUTH_PASSWORD',
+  'APP_DB_PASSWORD', 'CF_DB_PASSWORD',
   'EVOLUTION_API_KEY', 'GEOFENCE_WEBHOOK_SECRET', 'N8N_ENCRYPTION_KEY',
   'CF_RECOGNITION_API_KEY',
 ];

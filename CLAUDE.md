@@ -18,8 +18,6 @@ Self-hosted pipeline that automatically distributes hangout photos to friends vi
 - [scripts/setup-compreface.js](scripts/setup-compreface.js) — CLI for uploading friend reference photos
 - [docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md) — step-by-step install
 - [docs/SECURITY_TESTING_DEPLOYMENT.md](docs/SECURITY_TESTING_DEPLOYMENT.md) — security/test/deploy notes
-- [project_context.md](project_context.md) — single-file context bundle for LLM hand-off
-- `os-patch.cjs`, `fix.js`, `fix2.js` — Baileys/Evolution API WSL2 patch attempts (see Known issues)
 
 ## Common commands
 
@@ -74,7 +72,15 @@ Helper views: `v_ready_to_deliver`, `v_session_summary`.
 
 ## Known issues
 
-- **Evolution API on Windows WSL2 fails to generate QR codes.** Baileys uses `os.release()` to build the WhatsApp browser string; WSL2 returns a long kernel string WhatsApp rejects, causing a silent reconnect loop and `{"count": 0}` from `/instance/connect/:name`. The `command:` in [docker-compose.yml](docker-compose.yml) attempts a `sed` patch over `os.release()` → `"10.0"`. `os-patch.cjs`/`fix.js`/`fix2.js` are alternative attempts. None fully resolve the loop yet — see [project_context.md](project_context.md) for the full incident log before attempting another fix.
+- **Evolution API on Windows WSL2 QR code loop (MITIGATED).** Baileys uses `os.release()`, `os.platform()`, and `os.type()` to build the WhatsApp browser connection string. WSL2 returns Linux kernel values that WhatsApp rejects, causing a silent reconnect loop. **Current fix:** `evolution/patch.cjs` is loaded via `NODE_OPTIONS=--require` (baked into `evolution/Dockerfile`) and overrides all OS detection functions to return Windows-like values. The old `sed` hack in `docker-compose.yml` `command:` is removed. If the loop persists after `docker compose up -d --build`, check `docker compose logs -f evolution-api` for `[wsl2-patch] applied:` — if it doesn't appear, the patch isn't loading.
+
+## Recent changes (2026-05-29)
+
+- **WSL2 patch hardened:** `evolution/patch.cjs` now overrides `os.release()`, `os.type()`, `os.version()`, and `os.hostname()` (`os.platform()` is intentionally not overridden to avoid breaking native binaries). Dockerfile sets `CACHE_LOCAL_ENABLED=true` (required for session persistence).
+- **Workflow 01:** Added "Extract EXIF Data" node between photo metadata and save. `taken_at` now comes from EXIF `DateTimeOriginal` instead of Google Drive's upload timestamp.
+- **Workflow 02:** Added "Mark Processing" node after loading pending media — prevents infinite retries on failure. Added "Convert HEIC if Needed" + "Read Converted Photo" nodes for iPhone HEIC→JPEG conversion before CompreFace.
+- **Schema 001:** Aligned status CHECK to include `'erased'`, dedup index now excludes `'pending'` (matches 002).
+- **docker-compose.yml:** n8n entrypoint installs `exifreader` and `heic-convert` on first boot.
 
 ## Conventions
 

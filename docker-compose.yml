@@ -69,7 +69,7 @@ services:
   # n8n — workflow engine
   # =========================================================================
   n8n:
-    image: docker.n8n.io/n8nio/n8n:1.70.0
+    image: docker.n8n.io/n8nio/n8n:1.74.0
     container_name: autoshare-n8n
     restart: unless-stopped
     depends_on:
@@ -86,10 +86,8 @@ services:
       N8N_PORT: 5678
       N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
       WEBHOOK_URL: ${WEBHOOK_URL:-http://localhost:5678/}
-      # Wire basic auth — the .env values were ignored before this audit.
-      N8N_BASIC_AUTH_ACTIVE: "true"
-      N8N_BASIC_AUTH_USER: ${N8N_AUTH_USER:?Set N8N_AUTH_USER in .env}
-      N8N_BASIC_AUTH_PASSWORD: ${N8N_AUTH_PASSWORD:?Set N8N_AUTH_PASSWORD in .env}
+      # Auth: n8n 1.x uses owner-based auth created via UI on first launch.
+      # N8N_BASIC_AUTH_* was removed in n8n v1.0 — do NOT set those vars.
       # Encryption key for stored credentials. NEVER let n8n auto-generate
       # this in prod — losing it bricks every credential.
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?Set N8N_ENCRYPTION_KEY in .env (openssl rand -hex 32)}
@@ -106,6 +104,23 @@ services:
       # Required modules for inline JS in workflow Function nodes
       NODE_FUNCTION_ALLOW_EXTERNAL: "axios,form-data,heic-convert,fluent-ffmpeg,exifreader"
       N8N_METRICS: "true"
+      # --- Custom Application Variables ---
+      WORKFLOW_PROCESS_ID: ${WORKFLOW_PROCESS_ID}
+      GDRIVE_FOLDER_ID: ${GDRIVE_FOLDER_ID}
+      CF_RECOGNITION_API_KEY: ${CF_RECOGNITION_API_KEY}
+      FACE_CONFIDENCE_THRESHOLD: ${FACE_CONFIDENCE_THRESHOLD:-0.85}
+      GEOFENCE_WEBHOOK_SECRET: ${GEOFENCE_WEBHOOK_SECRET}
+      WHATSAPP_GROUP_JID: ${WHATSAPP_GROUP_JID}
+      WA_MIN_DELAY_MS: ${WA_MIN_DELAY_MS:-4000}
+      WA_MAX_DELAY_MS: ${WA_MAX_DELAY_MS:-12000}
+      WA_BATCH_SIZE: ${WA_BATCH_SIZE:-8}
+      WA_BATCH_COOLDOWN_MS: ${WA_BATCH_COOLDOWN_MS:-180000}
+      EVOLUTION_INSTANCE_NAME: ${EVOLUTION_INSTANCE_NAME:-autoshare}
+      EVOLUTION_API_KEY: ${EVOLUTION_API_KEY}
+      MY_WHATSAPP_NUMBER: ${MY_WHATSAPP_NUMBER}
+    # Install external packages that workflow Code nodes require.
+    # The n8n base image doesn't include them; they persist in the n8n_data volume.
+    entrypoint: ["sh", "-c", "cd /home/node && npm install --no-save exifreader heic-convert 2>/dev/null || true; n8n start"]
     volumes:
       - n8n_data:/home/node/.n8n
       - media_cache:/home/node/media_cache
@@ -114,7 +129,7 @@ services:
     networks:
       - autoshare_net
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz | grep -q ok || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz | grep -q ok || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -130,7 +145,7 @@ services:
   # CompreFace cluster (face recognition)
   # =========================================================================
   compreface-postgres:
-    image: postgres:13-alpine
+    image: postgres:11.5
     container_name: autoshare-compreface-db
     restart: unless-stopped
     environment:
@@ -274,7 +289,7 @@ services:
       app-postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/ | grep -qi 'evolution' || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ | grep -qi 'evolution' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5

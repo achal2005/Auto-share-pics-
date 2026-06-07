@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS media_files (
     session_id          UUID REFERENCES hangout_sessions(id),
     -- Processing state
     -- FIX #10: Enforce valid status values via CHECK constraint
-    status              VARCHAR(20)  DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'processed', 'delivered', 'failed', 'skipped')),  -- pending, processing, processed, delivered, failed, skipped
+    status              VARCHAR(20)  DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'processed', 'delivered', 'failed', 'skipped', 'erased')),  -- pending, processing, processed, delivered, failed, skipped, erased
     process_attempts    INTEGER      DEFAULT 0,
     last_error          TEXT,
     -- Media type
@@ -161,9 +161,9 @@ CREATE TABLE IF NOT EXISTS delivery_logs (
 CREATE INDEX idx_delivery_media ON delivery_logs(media_file_id);
 CREATE INDEX idx_delivery_session ON delivery_logs(session_id);
 CREATE INDEX idx_delivery_status ON delivery_logs(status);
--- Composite index to prevent duplicate sends
--- FIX #2: Make it partial to not block retries
-CREATE UNIQUE INDEX idx_delivery_dedup ON delivery_logs(media_file_id, recipient_jid) WHERE status IN ('pending', 'sent', 'delivered', 'read');
+-- Composite index to prevent duplicate sends (partial: only constrains successful sends,
+-- not pending/failed rows, so retries are not blocked)
+CREATE UNIQUE INDEX idx_delivery_dedup ON delivery_logs(media_file_id, recipient_jid) WHERE status IN ('sent', 'delivered', 'read');
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- HELPER VIEWS

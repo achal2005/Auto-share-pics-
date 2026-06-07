@@ -174,6 +174,7 @@ CREATE INDEX IF NOT EXISTS idx_delivery_recent
 -- ----------------------------------------------------------------------------
 -- 5. Helper views: rebuild with deleted_at filters
 -- ----------------------------------------------------------------------------
+DROP VIEW IF EXISTS v_ready_to_deliver CASCADE;
 CREATE OR REPLACE VIEW v_ready_to_deliver AS
 SELECT
     m.id                                        AS media_id,
@@ -198,6 +199,7 @@ WHERE m.status = 'processed'
   )
 ORDER BY m.taken_at ASC NULLS LAST;
 
+DROP VIEW IF EXISTS v_session_summary CASCADE;
 CREATE OR REPLACE VIEW v_session_summary AS
 SELECT
     s.id,

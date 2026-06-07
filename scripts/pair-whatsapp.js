@@ -46,7 +46,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function ensureInstance() {
   const list = await client.get('/instance/fetchInstances');
-  const found = (list.data || []).find((i) => i.instance?.instanceName === NAME || i.name === NAME);
+  // Evolution API v2.x returns a flat array; v1.x wrapped in { data: [...] }
+  const instances = Array.isArray(list.data) ? list.data : (list.data?.data || []);
+  const found = instances.find((i) => (i.instance?.instanceName || i.instanceName || i.name) === NAME);
   if (found) {
     console.log(`Instance "${NAME}" already exists.`);
     return;
